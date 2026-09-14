@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Generated output
+output/
+runs/
+test_run*/
+visual_check/
+contact_sheet.png
+*.zip
+
+# Scraped third-party content (harvest scripts are tracked)
+generator/harvest/*.html
+generator/harvest/images/
+generator/harvest/*.jsonl
+
+# Third-party reference material
+LLMs_on_Geometry.pdf
+
+# Editor
+.vscode/
+*.code-workspace
+
+# Secrets
+.env
+.env.*

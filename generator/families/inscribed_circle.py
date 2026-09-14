@@ -1,0 +1,183 @@
+"""Circular regions: a circle inscribed in a regular polygon, tangent to every side.
+
+Covers the paper's *circular regions* configuration, and targets the error category
+its taxonomy ranks second-largest -- circle and tangency confusion, over 20% of all
+errors across the three models tested.
+
+Tangency is the point. The circle touches each side at exactly one point, so the
+radius is not drawn and cannot be measured off the figure: it must be *inferred*
+from the tangency, as the polygon's apothem. A model that reads the circle as
+merely "inside" the polygon rather than inscribed in it has no way to recover the
+radius, which is precisely the confusion the taxonomy names.
+
+What is given and what is withheld
+----------------------------------
+Given: the side length, labelled on every side.
+Withheld: the side count (countable only from the figure) and the radius (derivable
+only from the tangency). Two implicit quantities rather than one, which makes this
+family a harder perceptual task than ``nested_polygons``.
+
+The answer is the area between the polygon and the circle::
+
+    A = (k/4) * s^2 * cot(pi/k)  -  pi * (s / (2 * tan(pi/k)))^2
+
+Both terms carry ``cot(pi/k)``, so the answer stays exact but is rarely a radical:
+the circle contributes a ``pi`` and the polygon a cotangent, and they do not
+combine. That is the same shape as the benchmark's real answers.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from numpy.random import Generator as RNG
+    from sympy import Expr
+else:
+    RNG = Any
+    Expr = Any
+
+from generator.registry import GeometrySpec, Params, ValidationResult
+
+NAME = "inscribed_circle"
+
+#: Side-count bounds. The lower bound is 3; the upper is held below the point where
+#: a polygon and its inscribed circle become visually indistinguishable, which would
+#: leave the shaded ring too thin to read as a region at all.
+MIN_SIDES = 3
+MAX_SIDES = 8
+
+MIN_SIDE_LENGTH = 1
+MAX_SIDE_LENGTH = 20
+
+#: Smallest fraction of the polygon the ring may occupy and still be readable.
+#: 5% admits k up to 8 and rejects nothing below it, so it is a backstop against a
+#: future widening of MAX_SIDES rather than an active constraint today.
+MIN_RING_FRACTION = 0.05
+
+
+def apothem(k: int, side: float) -> float:
+    """Centre-to-edge distance, which for an inscribed circle is the radius."""
+    return side / (2 * math.tan(math.pi / k))
+
+
+def circumradius(k: int, side: float) -> float:
+    return side / (2 * math.sin(math.pi / k))
+
+
+def _vertices(k: int, side: float) -> list[list[float]]:
+    """Vertices of a regular k-gon, flat side down, centred on the origin."""
+    radius = circumradius(k, side)
+    start = -math.pi / 2 + math.pi / k
+    return [
+        [
+            radius * math.cos(start + 2 * math.pi * i / k),
+            radius * math.sin(start + 2 * math.pi * i / k),
+        ]
+        for i in range(k)
+    ]
+
+
+def ring_fraction(params: Params) -> float:
+    """Fraction of the polygon's area left uncovered by the inscribed circle.
+
+    The readability measure for this family. The inscribed circle covers
+    ``pi / (k * tan(pi/k))`` of the polygon, so the ring is what is left. It depends
+    only on the side count and shrinks fast as the polygon rounds off: 39.5% at
+    k=3, 5.2% at k=8, 2.3% at k=12. That decay is what the side-count ceiling and
+    ``MIN_RING_FRACTION`` are protecting against -- past a point the ring is a
+    hairline and the figure reads as a circle with a faint outline.
+    """
+    k = int(params["k"])
+    return 1 - math.pi / (k * math.tan(math.pi / k))
+
+
+def exact_area(k: int, side: int) -> Expr:
+    """Exact area of a regular k-gon: (k/4) * s^2 * cot(pi/k)."""
+    import sympy as sp
+
+    return sp.Rational(k, 4) * sp.Integer(side) ** 2 * sp.cot(sp.pi / sp.Integer(k))
+
+
+def exact_circle_area(k: int, side: int) -> Expr:
+    """Exact area of the inscribed circle: pi * apothem^2, apothem = s/(2 tan(pi/k))."""
+    import sympy as sp
+
+    r = sp.Integer(side) / (2 * sp.tan(sp.pi / sp.Integer(k)))
+    return sp.pi * r ** 2
+
+
+def sample(rng: RNG) -> Params:
+    """Draw a side count and an integer side length."""
+    return {
+        "k": int(rng.integers(MIN_SIDES, MAX_SIDES + 1)),
+        "side": int(rng.integers(MIN_SIDE_LENGTH, MAX_SIDE_LENGTH + 1)),
+    }
+
+
+def is_valid(params: Params) -> ValidationResult:
+    """Reject malformed or visually unreadable configurations."""
+    try:
+        k = int(params["k"])
+        side = int(params["side"])
+    except (KeyError, TypeError, ValueError) as exc:
+        return f"malformed params: {exc}"
+
+    if not (MIN_SIDES <= k <= MAX_SIDES):
+        return f"side count {k} outside [{MIN_SIDES}, {MAX_SIDES}]"
+    if side < MIN_SIDE_LENGTH:
+        return "side length must be positive"
+
+    fraction = ring_fraction(params)
+    if fraction < MIN_RING_FRACTION:
+        return (
+            f"ring too thin to read (occupies {fraction:.3f} of the polygon, "
+            f"below {MIN_RING_FRACTION})"
+        )
+    return True
+
+
+def solve(params: Params) -> tuple[str, Expr, GeometrySpec]:
+    """Return the question, the exact ring area, and what to draw."""
+    import sympy as sp
+
+    k = int(params["k"])
+    side = int(params["side"])
+
+    answer = sp.simplify(exact_area(k, side) - exact_circle_area(k, side))
+    stem = "Find the area of the shaded region."
+
+    points = _vertices(k, side)
+    radius = apothem(k, side)
+
+    spec: list[dict[str, Any]] = [
+        {"kind": "polygon", "id": "outer", "points": points, "role": "outer"},
+        {
+            "kind": "circle",
+            "id": "hole",
+            "center": [0.0, 0.0],
+            "radius": radius,
+            "role": "inner",
+        },
+        {
+            "kind": "region",
+            "operation": "difference",
+            "of": ["outer", "hole"],
+            "style": "shaded",
+        },
+    ]
+
+    for i in range(k):
+        start, end = points[i], points[(i + 1) % k]
+        spec.append(
+            {
+                "kind": "length_label",
+                "segment": [start, end],
+                "value": float(side),
+                "text": str(side),
+                "draw": True,
+                "owner": "outer",
+            }
+        )
+    return stem, answer, spec

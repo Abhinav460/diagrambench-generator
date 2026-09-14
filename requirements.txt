@@ -1,0 +1,10 @@
+# DiagramBench generator — pinned runtime and test dependencies.
+# Pinned to what resolved on this machine 2026-09-02. NOT verified against
+# Colab's preinstalled versions -- check before moving the notebook over.
+matplotlib==3.11.1
+numpy==2.5.2
+shapely==2.1.2
+sympy==1.14.0
+
+# test-only
+pytest==9.1.1
