@@ -1,6 +1,6 @@
 """The category field and the Category 1 prompt-leak check.
 
-Both close gaps between the two spec drafts: ``generator_spec.md`` carries a
+Both close gaps between the two spec drafts: ``docs/generator_spec_draft_v1.md`` carries a
 ``category`` field and a ``_leaks()`` guard that ``GENERATOR_SPEC.md`` -- the file
 the implementation plan names as the source of truth -- omits. The paper needs
 both, since its central result is the *gap* between the two categories and its
