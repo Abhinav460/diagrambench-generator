@@ -56,13 +56,24 @@ from typing import Any, Literal, Optional, Union
 __all__ = [
     "Category",
     "Datapoint",
+    "ORIGINS",
     "SchemaValidationError",
     "Origin",
     "canonical_params",
     "stem_leaks_geometry",
 ]
 
-Origin = Literal["generated", "harvested"]
+Origin = Literal["generated", "harvested", "structured"]
+
+#: Every accepted ``origin``. ``structured`` is a real problem entered by hand as a
+#: family's params: it has params and a signature like a generated record, no seed
+#: because nothing was drawn, and a known answer to check the family against.
+ORIGINS = ("generated", "harvested", "structured")
+
+#: Fields added after the manifest format was fixed, omitted from ``to_dict`` while
+#: unset so that records of the existing origins serialize byte-identically to the
+#: manifests already on disk.
+_OMIT_WHEN_NONE = frozenset({"expected_answer"})
 
 #: 1 = diagram-dependent, 2 = textual. The paper's two-category structure, and the
 #: variable its central claim is measured against, so it belongs in the record
@@ -216,8 +227,9 @@ class Datapoint:
     answer_decimal: float
     origin: Origin
 
-    # Procedural-generation provenance. Required for origin="generated" and
-    # None for origin="harvested": a harvested problem was not drawn from a
+    # Procedural-generation provenance. Required for origin="generated", required
+    # bar the seed for origin="structured", and None for origin="harvested": a
+    # harvested problem was not drawn from a
     # parameter space, so it has no seed, no params, and no generator version to
     # record, and a dedupe signature over absent params would be a fiction.
     # Enforced by _validate_origin_coupling rather than by the type, so that a
@@ -235,6 +247,11 @@ class Datapoint:
     retrieved_at: Optional[str] = None
     answer_source: Optional[str] = None
     original_answer: Optional[str] = None
+
+    # Structured-input provenance. Required for origin="structured": the known
+    # answer the source gives, as a sympy-parseable string, which the driver checked
+    # ``answer_exact`` against before emitting. Optional and unset for the others.
+    expected_answer: Optional[str] = None
 
     def __post_init__(self) -> None:
         # Canonicalize on the way in so callers may pass a dict while storage
@@ -261,10 +278,8 @@ class Datapoint:
         stem means the problem has no question, and params that will not survive a
         JSON round-trip mean the manifest cannot be reloaded.
         """
-        if self.origin not in ("generated", "harvested"):
-            raise SchemaValidationError(
-                f"origin must be 'generated' or 'harvested'; got {self.origin!r}"
-            )
+        if self.origin not in ORIGINS:
+            raise SchemaValidationError(f"origin must be one of {ORIGINS}; got {self.origin!r}")
 
         # Two traps: bool is a subclass of int, so True would pass as 1; and
         # 1.0 == 1, so a float would pass the membership test and then serialize
@@ -332,6 +347,55 @@ class Datapoint:
             if isinstance(self.seed, bool) or not isinstance(self.seed, int):
                 raise SchemaValidationError(f"seed must be an int; got {self.seed!r}")
 
+        elif self.origin == "structured":
+            required = ("params", "signature", "generator_version", "expected_answer")
+            missing = [name for name in required if getattr(self, name) is None]
+            if missing:
+                raise SchemaValidationError(
+                    f"origin='structured' requires {required}; missing {missing}"
+                )
+            for name in ("signature", "generator_version", "expected_answer"):
+                value = getattr(self, name)
+                if not isinstance(value, str) or not value.strip():
+                    raise SchemaValidationError(
+                        f"{name} must be a non-empty string; got {value!r}"
+                    )
+            # A seed on a record nothing was drawn for would claim a reproducibility
+            # path that does not exist.
+            if self.seed is not None:
+                raise SchemaValidationError(
+                    f"origin='structured' was not drawn from a seed; got seed={self.seed!r}"
+                )
+            self._validate_structured_param_keys()
+
+    def _validate_structured_param_keys(self) -> None:
+        """Require exactly the keys the family's ``solve`` reads.
+
+        Imports the registry lazily, so this module stays importable, and every other
+        origin validatable, without the family package.
+        """
+        from generator import registry
+
+        try:
+            family = registry.get(self.family)
+        except KeyError as exc:
+            raise SchemaValidationError(
+                f"origin='structured' needs a registered family; {exc.args[0]}"
+            ) from None
+        param_types = getattr(family, "PARAM_TYPES", None)
+        if param_types is None:
+            raise SchemaValidationError(
+                f"family {self.family!r} declares no PARAM_TYPES, so it cannot take structured input"
+            )
+        expected = set(param_types)
+        actual = {key for key, _ in self.params}  # type: ignore[union-attr]
+        if actual != expected:
+            raise SchemaValidationError(
+                f"params for family {self.family!r} must have exactly the keys "
+                f"{sorted(expected)}; missing {sorted(expected - actual)}, "
+                f"unexpected {sorted(actual - expected)}"
+            )
+
     def _validate_params(self) -> None:
         """Confirm params are hashable and survive a JSON round-trip unchanged."""
         try:
@@ -381,6 +445,8 @@ class Datapoint:
         out: dict[str, Any] = {}
         for f in fields(self):
             value = getattr(self, f.name)
+            if value is None and f.name in _OMIT_WHEN_NONE:
+                continue
             out[f.name] = self.params_dict if f.name == "params" else value
         return out
 

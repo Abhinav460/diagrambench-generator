@@ -27,6 +27,7 @@ cotangents and the composite family's integers.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -36,9 +37,23 @@ else:
     RNG = Any
     Expr = Any
 
-from generator.registry import GeometrySpec, Params, ValidationResult
+from generator.params import parse_params
+from generator.registry import (
+    GEOMETRY,
+    READABILITY,
+    GeometrySpec,
+    Issue,
+    Params,
+    ValidationResult,
+    first_issue,
+)
 
 NAME = "coordinate_polygon"
+
+#: Integer vertices only, including for structured input. This is a lattice family:
+#: the withheld vertices are recovered by counting grid squares, which a vertex at
+#: (2.5, 1) defeats. A non-lattice polygon belongs in a different family.
+PARAM_TYPES = {"points": "lattice_points"}
 
 #: Lattice bounds. Kept small so the grid stays countable at figure scale -- the
 #: whole task is counting squares, and a 40-wide grid renders as hatching.
@@ -119,35 +134,102 @@ def sample(rng: RNG) -> Params:
     return {"points": _counter_clockwise(points)}
 
 
-def is_valid(params: Params) -> ValidationResult:
-    """Reject degenerate, non-convex, or unreadably small polygons."""
-    try:
-        points = [[int(x), int(y)] for x, y in params["points"]]
-    except (KeyError, TypeError, ValueError) as exc:
-        return f"malformed params: {exc}"
+def _segments_intersect(a: list[int], b: list[int], c: list[int], d: list[int]) -> bool:
+    """Whether closed segments ab and cd share any point. Exact on integers."""
 
-    if not (MIN_VERTICES <= len(points) <= MAX_VERTICES):
-        return f"vertex count {len(points)} outside [{MIN_VERTICES}, {MAX_VERTICES}]"
+    def orient(p: list[int], q: list[int], r: list[int]) -> int:
+        cross = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+        return (cross > 0) - (cross < 0)
+
+    def on_segment(p: list[int], q: list[int], r: list[int]) -> bool:
+        return min(p[0], r[0]) <= q[0] <= max(p[0], r[0]) and min(p[1], r[1]) <= q[1] <= max(p[1], r[1])
+
+    o1, o2, o3, o4 = orient(a, b, c), orient(a, b, d), orient(c, d, a), orient(c, d, b)
+    if o1 != o2 and o3 != o4:
+        return True
+    return (
+        (o1 == 0 and on_segment(a, c, b))
+        or (o2 == 0 and on_segment(a, d, b))
+        or (o3 == 0 and on_segment(c, a, d))
+        or (o4 == 0 and on_segment(c, b, d))
+    )
+
+
+def _is_simple(points: list[list[int]]) -> bool:
+    """Whether the vertices form a simple polygon of positive area, convex or not.
+
+    The geometric requirement the shoelace answer actually has. Weaker than
+    ``_is_simple_and_convex``: an arrowhead or an L on the lattice is simple, and its
+    shoelace area is its true area.
+    """
+    n = len(points)
+    if shoelace([[float(x), float(y)] for x, y in points]) == 0:
+        return False
+    for i in range(n):
+        a, b, c = points[i], points[(i + 1) % n], points[(i + 2) % n]
+        cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
+        dot = (b[0] - a[0]) * (c[0] - b[0]) + (b[1] - a[1]) * (c[1] - b[1])
+        if cross == 0 and dot < 0:
+            return False  # the outline doubles back on itself
+    for i in range(n):
+        for j in range(i + 2, n):
+            if i == 0 and j == n - 1:
+                continue  # adjacent through the closing edge
+            if _segments_intersect(points[i], points[(i + 1) % n], points[j], points[(j + 1) % n]):
+                return False
+    return True
+
+
+def validation_issues(params: Params) -> Iterator[Issue]:
+    """Every problem with ``params``, by severity, in the order ``is_valid`` checks.
+
+    Geometry: at least three distinct vertices forming a simple polygon of positive
+    area. Readability: the vertex-count ceiling, the lattice bounds, convexity, and
+    the minimum area -- the filters that keep random draws from looking like
+    rendering bugs, none of which a real figure needs to satisfy.
+    """
+    try:
+        points = parse_params(PARAM_TYPES, params)["points"]
+    except (KeyError, TypeError, ValueError) as exc:
+        yield GEOMETRY, f"malformed params: {exc}"
+        return
+
+    count_reason = f"vertex count {len(points)} outside [{MIN_VERTICES}, {MAX_VERTICES}]"
+    if len(points) < MIN_VERTICES:
+        yield GEOMETRY, count_reason
+        return
+    if len(points) > MAX_VERTICES:
+        yield READABILITY, count_reason
     if len({tuple(p) for p in points}) != len(points):
-        return "duplicate vertices"
+        yield GEOMETRY, "duplicate vertices"
+        return
     for x, y in points:
         if not (MIN_COORD <= x <= MAX_COORD and MIN_COORD <= y <= MAX_COORD):
-            return f"vertex ({x}, {y}) outside the lattice bounds"
+            yield READABILITY, f"vertex ({x}, {y}) outside the lattice bounds"
+            break
 
+    shape_reason = "vertices are collinear or wind inconsistently (non-convex or self-intersecting)"
+    if not _is_simple(points):
+        yield GEOMETRY, shape_reason
+        return
     if not _is_simple_and_convex(points):
-        return "vertices are collinear or wind inconsistently (non-convex or self-intersecting)"
+        yield READABILITY, shape_reason
 
     area = shoelace([[float(x), float(y)] for x, y in points])
     if area < MIN_AREA:
-        return f"area {area:.1f} is below the readable minimum of {MIN_AREA}"
-    return True
+        yield READABILITY, f"area {area:.1f} is below the readable minimum of {MIN_AREA}"
+
+
+def is_valid(params: Params) -> ValidationResult:
+    """Reject degenerate, non-convex, or unreadably small polygons."""
+    return first_issue(validation_issues(params))
 
 
 def solve(params: Params) -> tuple[str, Expr, GeometrySpec]:
     """Return the question, the exact area, and what to draw."""
     import sympy as sp
 
-    points = [[int(x), int(y)] for x, y in params["points"]]
+    points = parse_params(PARAM_TYPES, params)["points"]
     answer = sp.simplify(exact_area(points))
     stem = "Find the area of the shaded region."
 

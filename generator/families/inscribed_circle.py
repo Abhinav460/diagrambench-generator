@@ -29,6 +29,8 @@ combine. That is the same shape as the benchmark's real answers.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
+from fractions import Fraction
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -38,9 +40,21 @@ else:
     RNG = Any
     Expr = Any
 
-from generator.registry import GeometrySpec, Params, ValidationResult
+from generator.params import exact, length_text, parse_params, parse_value
+from generator.registry import (
+    GEOMETRY,
+    READABILITY,
+    GeometrySpec,
+    Issue,
+    Params,
+    ValidationResult,
+    first_issue,
+)
 
 NAME = "inscribed_circle"
+
+#: Side count is a count; the side is a length, and may be any positive real.
+PARAM_TYPES = {"k": "integer", "side": "length"}
 
 #: Side-count bounds. The lower bound is 3; the upper is held below the point where
 #: a polygon and its inscribed circle become visually indistinguishable, which would
@@ -89,22 +103,22 @@ def ring_fraction(params: Params) -> float:
     ``MIN_RING_FRACTION`` are protecting against -- past a point the ring is a
     hairline and the figure reads as a circle with a faint outline.
     """
-    k = int(params["k"])
+    k = parse_value("integer", "k", params["k"])
     return 1 - math.pi / (k * math.tan(math.pi / k))
 
 
-def exact_area(k: int, side: int) -> Expr:
+def exact_area(k: int, side: int | Fraction) -> Expr:
     """Exact area of a regular k-gon: (k/4) * s^2 * cot(pi/k)."""
     import sympy as sp
 
-    return sp.Rational(k, 4) * sp.Integer(side) ** 2 * sp.cot(sp.pi / sp.Integer(k))
+    return sp.Rational(k, 4) * exact(side) ** 2 * sp.cot(sp.pi / sp.Integer(k))
 
 
-def exact_circle_area(k: int, side: int) -> Expr:
+def exact_circle_area(k: int, side: int | Fraction) -> Expr:
     """Exact area of the inscribed circle: pi * apothem^2, apothem = s/(2 tan(pi/k))."""
     import sympy as sp
 
-    r = sp.Integer(side) / (2 * sp.tan(sp.pi / sp.Integer(k)))
+    r = exact(side) / (2 * sp.tan(sp.pi / sp.Integer(k)))
     return sp.pi * r ** 2
 
 
@@ -116,40 +130,54 @@ def sample(rng: RNG) -> Params:
     }
 
 
-def is_valid(params: Params) -> ValidationResult:
-    """Reject malformed or visually unreadable configurations."""
-    try:
-        k = int(params["k"])
-        side = int(params["side"])
-    except (KeyError, TypeError, ValueError) as exc:
-        return f"malformed params: {exc}"
+def validation_issues(params: Params) -> Iterator[Issue]:
+    """Every problem with ``params``, by severity, in the order ``is_valid`` checks.
 
-    if not (MIN_SIDES <= k <= MAX_SIDES):
-        return f"side count {k} outside [{MIN_SIDES}, {MAX_SIDES}]"
-    if side < MIN_SIDE_LENGTH:
-        return "side length must be positive"
+    Geometry: a real side count of at least 3 and a positive side. Readability: the
+    side-count ceiling and the ring fraction, both of which exist to keep the ring
+    visible rather than to keep the figure well-formed.
+    """
+    try:
+        values = parse_params(PARAM_TYPES, params)
+    except (KeyError, TypeError, ValueError) as exc:
+        yield GEOMETRY, f"malformed params: {exc}"
+        return
+    k, side = values["k"], values["side"]
+
+    if k < MIN_SIDES:
+        yield GEOMETRY, f"side count {k} outside [{MIN_SIDES}, {MAX_SIDES}]"
+        return
+    if k > MAX_SIDES:
+        yield READABILITY, f"side count {k} outside [{MIN_SIDES}, {MAX_SIDES}]"
+    if side <= 0:
+        yield GEOMETRY, "side length must be positive"
+        return
 
     fraction = ring_fraction(params)
     if fraction < MIN_RING_FRACTION:
-        return (
+        yield READABILITY, (
             f"ring too thin to read (occupies {fraction:.3f} of the polygon, "
             f"below {MIN_RING_FRACTION})"
         )
-    return True
+
+
+def is_valid(params: Params) -> ValidationResult:
+    """Reject malformed or visually unreadable configurations."""
+    return first_issue(validation_issues(params))
 
 
 def solve(params: Params) -> tuple[str, Expr, GeometrySpec]:
     """Return the question, the exact ring area, and what to draw."""
     import sympy as sp
 
-    k = int(params["k"])
-    side = int(params["side"])
+    values = parse_params(PARAM_TYPES, params)
+    k, side = values["k"], values["side"]
 
     answer = sp.simplify(exact_area(k, side) - exact_circle_area(k, side))
     stem = "Find the area of the shaded region."
 
-    points = _vertices(k, side)
-    radius = apothem(k, side)
+    points = _vertices(k, float(side))
+    radius = apothem(k, float(side))
 
     spec: list[dict[str, Any]] = [
         {"kind": "polygon", "id": "outer", "points": points, "role": "outer"},
@@ -175,7 +203,7 @@ def solve(params: Params) -> tuple[str, Expr, GeometrySpec]:
                 "kind": "length_label",
                 "segment": [start, end],
                 "value": float(side),
-                "text": str(side),
+                "text": length_text(side),
                 "draw": True,
                 "owner": "outer",
             }
