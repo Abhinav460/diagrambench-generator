@@ -23,7 +23,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import pkgutil
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Optional, Protocol, Union, runtime_checkable
 
@@ -40,7 +40,12 @@ __all__ = [
     "GeometrySpec",
     "Params",
     "ValidationResult",
+    "GEOMETRY",
+    "Issue",
+    "READABILITY",
     "available",
+    "classify_issues",
+    "first_issue",
     "get",
     "register",
     "rejection_reason",
@@ -85,6 +90,11 @@ class Family(Protocol):
     must inherit from anything; ``register`` checks the shape explicitly in order
     to produce an error message naming what is missing, which ``isinstance``
     against a Protocol cannot do.
+
+    Two further attributes are optional for registration but required to accept
+    structured (hand-supplied) input: ``PARAM_TYPES``, mapping each param name to a
+    kind in ``generator.params``, and ``validation_issues(params)``, yielding
+    ``(GEOMETRY | READABILITY, reason)`` pairs in the order ``is_valid`` checks them.
     """
 
     NAME: str
@@ -116,6 +126,59 @@ class Family(Protocol):
         ``geometry_spec`` describes what to draw, and is what ``verify`` rebuilds
         from -- so it, not ``params``, is the thing that must agree with the answer.
         """
+
+
+#: Severity of a validation issue. A *geometry* issue means the params do not
+#: describe a well-formed figure whose answer the family's formula gives: a
+#: polygon with fewer than three sides, a notch outside its rectangle, an inner
+#: polygon that crosses the outer one. A *readability* issue means the figure is
+#: well-formed but falls outside the heuristics that keep random draws legible: a
+#: hairline ring, a 20-gon, a notch that swallows most of the figure.
+GEOMETRY = "geometry"
+READABILITY = "readability"
+
+#: One ``(severity, reason)`` pair, as yielded by a family's ``validation_issues``.
+Issue = tuple[str, str]
+
+
+def first_issue(issues: Iterable[Issue]) -> ValidationResult:
+    """``is_valid`` for random draws: the first issue of either severity rejects.
+
+    Families implement ``is_valid`` as ``first_issue(validation_issues(params))``,
+    yielding their checks in the order ``is_valid`` always ran them, with the same
+    messages. So a random draw is rejected by exactly the checks, and with exactly
+    the reason, that it was before the checks were split by severity.
+    """
+    for _severity, reason in issues:
+        return reason
+    return True
+
+
+def classify_issues(family: Any, params: Params) -> tuple[Optional[str], list[str]]:
+    """``(blocking_reason, readability_warnings)`` for a hand-supplied parameter set.
+
+    The structured-input counterpart of ``first_issue``: readability issues are
+    collected as warnings, and the first geometry issue stops the scan and blocks.
+    Checks after a geometry issue are not run, since they may assume what it
+    rejected.
+    """
+    issues = getattr(family, "validation_issues", None)
+    if issues is None:
+        raise FamilyContractError(
+            f"family {getattr(family, 'NAME', family)!r} does not define "
+            f"validation_issues, so it cannot accept structured input"
+        )
+    warnings: list[str] = []
+    for severity, reason in issues(params):
+        if severity == GEOMETRY:
+            return reason, warnings
+        if severity != READABILITY:
+            raise FamilyContractError(
+                f"validation issue severity must be {GEOMETRY!r} or {READABILITY!r}; "
+                f"got {severity!r}"
+            )
+        warnings.append(reason)
+    return None, warnings
 
 
 def rejection_reason(result: ValidationResult) -> Optional[str]:

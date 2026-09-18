@@ -32,6 +32,8 @@ look alike lets a model pattern-match the *form* of an answer rather than derive
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from fractions import Fraction
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -41,9 +43,24 @@ else:
     RNG = Any
     Expr = Any
 
-from generator.registry import GeometrySpec, Params, ValidationResult
+from generator.params import exact, length_text, parse_params
+from generator.registry import (
+    GEOMETRY,
+    READABILITY,
+    GeometrySpec,
+    Issue,
+    Params,
+    ValidationResult,
+    first_issue,
+)
 
 NAME = "composite_rectilinear"
+
+#: All four are lengths. Random draws use integers, but nothing in the geometry
+#: needs them: a 12.5 by 6 figure with a 5 by 2.5 notch is an ordinary L.
+PARAM_TYPES = {"width": "length", "height": "length", "notch_w": "length", "notch_h": "length"}
+
+Length = int | Fraction
 
 #: Outer dimensions, in the same integer units the labels display.
 MIN_SIDE = 4
@@ -56,7 +73,7 @@ MIN_NOTCH_FRACTION = 0.25
 MAX_NOTCH_FRACTION = 0.75
 
 
-def _outline(width: int, height: int, notch_w: int, notch_h: int) -> list[list[float]]:
+def _outline(width: Length, height: Length, notch_w: Length, notch_h: Length) -> list[list[float]]:
     """The six vertices of the L, counter-clockwise from the origin.
 
     Ordered counter-clockwise so the shoelace area is positive and the outline
@@ -74,11 +91,9 @@ def _outline(width: int, height: int, notch_w: int, notch_h: int) -> list[list[f
     ]
 
 
-def exact_area(width: int, height: int, notch_w: int, notch_h: int) -> Expr:
-    """Outer rectangle minus the notch. Exact and integral by construction."""
-    import sympy as sp
-
-    return sp.Integer(width) * sp.Integer(height) - sp.Integer(notch_w) * sp.Integer(notch_h)
+def exact_area(width: Length, height: Length, notch_w: Length, notch_h: Length) -> Expr:
+    """Outer rectangle minus the notch. Exact, and integral for integer sides."""
+    return exact(width) * exact(height) - exact(notch_w) * exact(notch_h)
 
 
 def sample(rng: RNG) -> Params:
@@ -94,46 +109,62 @@ def sample(rng: RNG) -> Params:
     }
 
 
-def is_valid(params: Params) -> ValidationResult:
-    """Reject notches that leave no L, or that swallow the figure."""
+def validation_issues(params: Params) -> Iterator[Issue]:
+    """Every problem with ``params``, by severity, in the order ``is_valid`` checks.
+
+    Geometry: positive outer dimensions, and a positive notch strictly inside them
+    -- anything else is not an L. Readability: the outer-dimension range and the
+    notch fractions, which keep a random draw from producing slivers.
+    """
     try:
-        width = int(params["width"])
-        height = int(params["height"])
-        notch_w = int(params["notch_w"])
-        notch_h = int(params["notch_h"])
+        values = parse_params(PARAM_TYPES, params)
     except (KeyError, TypeError, ValueError) as exc:
-        return f"malformed params: {exc}"
+        yield GEOMETRY, f"malformed params: {exc}"
+        return
+    width, height = values["width"], values["height"]
+    notch_w, notch_h = values["notch_w"], values["notch_h"]
+    dims = f"{length_text(width)}x{length_text(height)}"
 
+    if width <= 0 or height <= 0:
+        yield GEOMETRY, f"outer dimensions {dims} outside [{MIN_SIDE}, {MAX_SIDE}]"
+        return
     if not (MIN_SIDE <= width <= MAX_SIDE) or not (MIN_SIDE <= height <= MAX_SIDE):
-        return f"outer dimensions {width}x{height} outside [{MIN_SIDE}, {MAX_SIDE}]"
-    if notch_w < 1 or notch_h < 1:
-        return "notch must have positive dimensions"
+        yield READABILITY, f"outer dimensions {dims} outside [{MIN_SIDE}, {MAX_SIDE}]"
+    if notch_w <= 0 or notch_h <= 0:
+        yield GEOMETRY, "notch must have positive dimensions"
+        return
     if notch_w >= width or notch_h >= height:
-        return f"notch {notch_w}x{notch_h} is not strictly inside {width}x{height}"
+        yield GEOMETRY, (
+            f"notch {length_text(notch_w)}x{length_text(notch_h)} is not strictly inside {dims}"
+        )
+        return
 
-    w_fraction = notch_w / width
-    h_fraction = notch_h / height
+    w_fraction = float(notch_w / width)
+    h_fraction = float(notch_h / height)
     if not (MIN_NOTCH_FRACTION <= w_fraction <= MAX_NOTCH_FRACTION):
-        return (
+        yield READABILITY, (
             f"notch width is {w_fraction:.2f} of the figure, outside "
             f"[{MIN_NOTCH_FRACTION}, {MAX_NOTCH_FRACTION}]"
         )
     if not (MIN_NOTCH_FRACTION <= h_fraction <= MAX_NOTCH_FRACTION):
-        return (
+        yield READABILITY, (
             f"notch height is {h_fraction:.2f} of the figure, outside "
             f"[{MIN_NOTCH_FRACTION}, {MAX_NOTCH_FRACTION}]"
         )
-    return True
+
+
+def is_valid(params: Params) -> ValidationResult:
+    """Reject notches that leave no L, or that swallow the figure."""
+    return first_issue(validation_issues(params))
 
 
 def solve(params: Params) -> tuple[str, Expr, GeometrySpec]:
     """Return the question, the exact area, and what to draw."""
     import sympy as sp
 
-    width = int(params["width"])
-    height = int(params["height"])
-    notch_w = int(params["notch_w"])
-    notch_h = int(params["notch_h"])
+    values = parse_params(PARAM_TYPES, params)
+    width, height = values["width"], values["height"]
+    notch_w, notch_h = values["notch_w"], values["notch_h"]
 
     answer = sp.simplify(exact_area(width, height, notch_w, notch_h))
     stem = "Find the area of the shaded figure."
@@ -162,7 +193,7 @@ def solve(params: Params) -> tuple[str, Expr, GeometrySpec]:
                 "kind": "length_label",
                 "segment": [points[i], points[(i + 1) % len(points)]],
                 "value": float(length),
-                "text": str(length),
+                "text": length_text(length),
                 "draw": draw,
                 "owner": "figure",
             }

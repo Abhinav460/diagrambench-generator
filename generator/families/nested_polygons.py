@@ -56,6 +56,8 @@ areas essentially never have.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
+from fractions import Fraction
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -65,9 +67,22 @@ else:
     RNG = Any
     Expr = Any
 
-from generator.registry import GeometrySpec, Params, ValidationResult
+from generator.params import exact, length_text, parse_params
+from generator.registry import (
+    GEOMETRY,
+    READABILITY,
+    GeometrySpec,
+    Issue,
+    Params,
+    ValidationResult,
+    first_issue,
+)
 
 NAME = "nested_polygons"
+
+#: Side counts are counts; sides are lengths. Random draws use integer sides, but
+#: the geometry accepts any positive real.
+PARAM_TYPES = {"n": "integer", "m": "integer", "side_outer": "length", "side_inner": "length"}
 
 #: Side-count bounds. The upper bound keeps side-counting a reasonable visual task;
 #: a 20-gon is indistinguishable from a circle at figure scale, which would make the
@@ -131,16 +146,41 @@ def fill_ratio(params: Params) -> float:
     conservative: it guarantees containment at any relative rotation, so validity
     never depends on the orientation convention chosen in ``_start_angle``.
     """
-    inner = circumradius(int(params["m"]), float(params["side_inner"]))
-    outer = apothem(int(params["n"]), float(params["side_outer"]))
+    values = parse_params(PARAM_TYPES, params)
+    inner = circumradius(values["m"], float(values["side_inner"]))
+    outer = apothem(values["n"], float(values["side_outer"]))
     return inner / outer
 
 
-def exact_area(k: int, side: int) -> Expr:
+def inner_fits(n: int, m: int, side_outer: int | Fraction, side_inner: int | Fraction) -> bool:
+    """Whether the inner polygon, as drawn, lies inside the outer one.
+
+    The exact containment test, in the orientation ``_vertices`` actually draws.
+    ``fill_ratio <= 1`` guarantees containment at any rotation and so is sufficient
+    but not necessary: a hexagon inside a square can fit with a ratio above 1. The
+    answer ``area(outer) - area(inner)`` is correct exactly when this holds, so it
+    is the geometry check; the ratio remains a readability check.
+
+    The outer polygon is convex and wound counter-clockwise, so a point is inside
+    when it is on the left of (or on) every edge. Touching the boundary counts as
+    fitting: the shaded region's area is unchanged.
+    """
+    outer = _vertices(n, float(side_outer))
+    inner = _vertices(m, float(side_inner))
+    tolerance = 1e-9 * circumradius(n, float(side_outer)) ** 2
+    for i in range(n):
+        (ax, ay), (bx, by) = outer[i], outer[(i + 1) % n]
+        for px, py in inner:
+            if (bx - ax) * (py - ay) - (by - ay) * (px - ax) < -tolerance:
+                return False
+    return True
+
+
+def exact_area(k: int, side: int | Fraction) -> Expr:
     """Exact area of a regular k-gon: (k/4) * s^2 * cot(pi/k)."""
     import sympy as sp
 
-    return sp.Rational(k, 4) * sp.Integer(side) ** 2 * sp.cot(sp.pi / sp.Integer(k))
+    return sp.Rational(k, 4) * exact(side) ** 2 * sp.cot(sp.pi / sp.Integer(k))
 
 
 # --- family contract ------------------------------------------------------
@@ -164,52 +204,72 @@ def sample(rng: RNG) -> Params:
     }
 
 
+def validation_issues(params: Params) -> Iterator[Issue]:
+    """Every problem with ``params``, by severity, in the order ``is_valid`` checks.
+
+    Geometry: side counts of at least 3, positive sides, and an inner polygon that
+    actually lies inside the outer one. Readability: the side-count ceiling, the
+    inner-fewer-sides rule, and both fill-ratio margins. A square inside a hexagon
+    fails none of the geometry, and a real problem may well draw one.
+    """
+    try:
+        values = parse_params(PARAM_TYPES, params)
+    except (KeyError, TypeError, ValueError) as exc:
+        yield GEOMETRY, f"malformed params: {exc}"
+        return
+    n, m = values["n"], values["m"]
+    side_outer, side_inner = values["side_outer"], values["side_inner"]
+
+    for label, count in (("outer", n), ("inner", m)):
+        reason = f"{label} side count {count} outside [{MIN_SIDES}, {MAX_SIDES}]"
+        if count < MIN_SIDES:
+            yield GEOMETRY, reason
+            return
+        if count > MAX_SIDES:
+            yield READABILITY, reason
+    if m >= n:
+        yield READABILITY, f"inner side count {m} is not less than outer {n}"
+    if side_outer <= 0 or side_inner <= 0:
+        yield GEOMETRY, "side lengths must be positive"
+        return
+
+    ratio = fill_ratio(params)
+    clearance_reason = (
+        f"inner polygon does not fit with clearance (fill ratio {ratio:.3f} > {MAX_FILL_RATIO})"
+    )
+    if not inner_fits(n, m, side_outer, side_inner):
+        yield GEOMETRY, clearance_reason
+        return
+    if ratio > MAX_FILL_RATIO:
+        yield READABILITY, clearance_reason
+    if ratio < MIN_FILL_RATIO:
+        yield READABILITY, (
+            f"inner polygon too small to read (fill ratio {ratio:.3f} < {MIN_FILL_RATIO})"
+        )
+
+
 def is_valid(params: Params) -> ValidationResult:
     """Reject configurations that are malformed, non-containing, or unreadable.
 
     Returns a specific reason string on every rejection path so that a low
     acceptance rate can be attributed to a cause instead of guessed at.
     """
-    try:
-        n = int(params["n"])
-        m = int(params["m"])
-        side_outer = int(params["side_outer"])
-        side_inner = int(params["side_inner"])
-    except (KeyError, TypeError, ValueError) as exc:
-        return f"malformed params: {exc}"
-
-    if not (MIN_SIDES <= n <= MAX_SIDES):
-        return f"outer side count {n} outside [{MIN_SIDES}, {MAX_SIDES}]"
-    if not (MIN_SIDES <= m <= MAX_SIDES):
-        return f"inner side count {m} outside [{MIN_SIDES}, {MAX_SIDES}]"
-    if m >= n:
-        return f"inner side count {m} is not less than outer {n}"
-    if side_outer < MIN_SIDE_LENGTH or side_inner < MIN_SIDE_LENGTH:
-        return "side lengths must be positive"
-
-    ratio = fill_ratio(params)
-    if ratio > MAX_FILL_RATIO:
-        return f"inner polygon does not fit with clearance (fill ratio {ratio:.3f} > {MAX_FILL_RATIO})"
-    if ratio < MIN_FILL_RATIO:
-        return f"inner polygon too small to read (fill ratio {ratio:.3f} < {MIN_FILL_RATIO})"
-
-    return True
+    return first_issue(validation_issues(params))
 
 
 def solve(params: Params) -> tuple[str, Expr, GeometrySpec]:
     """Return the question, the exact shaded area, and what to draw."""
-    n = int(params["n"])
-    m = int(params["m"])
-    side_outer = int(params["side_outer"])
-    side_inner = int(params["side_inner"])
+    values = parse_params(PARAM_TYPES, params)
+    n, m = values["n"], values["m"]
+    side_outer, side_inner = values["side_outer"], values["side_inner"]
 
     import sympy as sp
 
     answer = sp.simplify(exact_area(n, side_outer) - exact_area(m, side_inner))
     stem = "Find the area of the shaded region."
 
-    outer_points = _vertices(n, side_outer)
-    inner_points = _vertices(m, side_inner)
+    outer_points = _vertices(n, float(side_outer))
+    inner_points = _vertices(m, float(side_inner))
 
     spec: list[dict[str, Any]] = [
         {"kind": "polygon", "id": "outer", "points": outer_points, "role": "outer"},
@@ -226,7 +286,7 @@ def solve(params: Params) -> tuple[str, Expr, GeometrySpec]:
     return stem, answer, spec
 
 
-def _length_labels(points: list[list[float]], side: int, owner: str) -> list[dict[str, Any]]:
+def _length_labels(points: list[list[float]], side: int | Fraction, owner: str) -> list[dict[str, Any]]:
     """Emit one label per side, or a single label, per ``LABEL_EVERY_SIDE``.
 
     All sides of a regular polygon are equal, so labelling every one repeats a
@@ -243,7 +303,7 @@ def _length_labels(points: list[list[float]], side: int, owner: str) -> list[dic
                 "kind": "length_label",
                 "segment": [start, end],
                 "value": float(side),
-                "text": str(side),
+                "text": length_text(side),
                 "draw": True,
                 "owner": owner,
             }

@@ -76,6 +76,7 @@ records = list(read_manifest("runs/dev", strict=False))  # tolerate a killed run
 | `--max-draws` | `200 × --n` | Draw ceiling before giving up. |
 | `--progress-every` | `0` | Print progress to stderr every N problems. `0` disables. |
 | `--list-families` | — | List registered families and exit. |
+| `--from-file` | — | Emit one problem per row of a structured-input JSONL file instead of drawing. Cannot be combined with `--family`, `--n`, `--seed` or `--max-draws`. See "Structured problem input" below. |
 
 Exit codes: `0` reached `--n`; `1` a real failure (verification disagreement, or an
 unwritable output directory); `2` ran out of draws short of `--n`. A short run is
@@ -122,10 +123,54 @@ rejections by cause   :
   tighter validity predicate emits fewer. `inscribed_circle` leads because nothing
   in its sampled range is ever rejected.
 
+## Structured problem input
+
+To turn real problems into dataset records, write each one as a family's params
+and pass the file with `--from-file`. Every row goes through the same
+solve → verify → render → emit step a random draw does:
+
+```bash
+.venv/bin/python -m generator.cli --from-file examples/structured_problems.jsonl \
+    --out runs/structured --report
+```
+
+One JSON object per line:
+
+```json
+{"input_id": "circle_in_hexagon_10", "family": "inscribed_circle",
+ "params": {"k": 6, "side": 10}, "expected_answer": "150*sqrt(3) - 75*pi",
+ "source": {"site": "...", "url": "...", "problem_id": "12", "original_answer": "..."}}
+```
+
+- `params` must have exactly the family's keys, of the right kind, with no
+  coercion: side counts and lattice coordinates must be integers, while lengths may
+  be any number (`2.5` is two and a half, not 2). Keys per family: `nested_polygons`
+  `n, m, side_outer, side_inner`; `composite_rectilinear` `width, height, notch_w,
+  notch_h`; `coordinate_polygon` `points`; `inscribed_circle` `k, side`.
+- `expected_answer` is required. A row is emitted only if the family's exact answer
+  matches it to within `1e-9`. `verify` checks the figure against the family's
+  answer, so on its own it cannot tell when the family has solved a different
+  problem from the one the source posed. This check can.
+- `input_id` becomes the record's `problem_id` and image name. Records carry
+  `origin: "structured"`, no `seed`, and the `expected_answer` and `source` fields.
+- Only **geometry** checks block a row: fewer than three sides, a notch outside its
+  rectangle, an inner polygon crossing the outer one, a self-intersecting outline.
+  **Readability** checks (side-count ceilings, fill ratios, notch fractions,
+  convexity, lattice bounds) exist to filter noisy random draws. They are reported
+  as warnings for structured rows, and still reject random draws exactly as before.
+
+A bad row (load error, geometry rejection, answer mismatch, or duplicate) is
+reported and skipped, and the run exits `1`. `--report` lists every row as PASS
+or FAIL with its reason. `expected_answer` is restricted to numbers, arithmetic
+operators and a short list of names (`sqrt`, `cbrt`, `pi`, `E`, `Rational`, ...)
+before sympy parses it, so an input file cannot run code.
+
 ## How it fits together
 
 ```
-cli.py       driver loop: draw → validate → dedupe → solve → verify → render → emit
+cli.py       driver loop: draw (or structured row) → validate → dedupe → solve → verify → render → emit
+  structured.py  loads and type-checks structured-input rows
+  params.py      typed param reading shared by every family (no silent int())
   registry.py    finds family modules and enforces the contract structurally
   families/      the only thing that changes as new problem types are added
   geometry.py    geometry_spec → shapely, shared by render and verify
@@ -186,6 +231,11 @@ Drop a module in `generator/families/`. It is auto-discovered, and must define
   string is what makes a low acceptance rate diagnosable instead of guesswork.
 - `solve(params) -> (stem, answer_exact, geometry_spec)` — exact sympy answer, and
   the primitives to draw. No matplotlib import; a test enforces that too.
+
+To accept structured input a family also defines `PARAM_TYPES` (param name → kind in
+`generator/params.py`) and `validation_issues(params)`, which yields
+`(GEOMETRY | READABILITY, reason)` pairs in check order. `is_valid` is then just
+`first_issue(validation_issues(params))`.
 
 A module missing any of these fails registration loudly, naming what is missing.
 The `geometry_spec` format is documented in `generator/families/nested_polygons.py`;

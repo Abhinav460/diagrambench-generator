@@ -202,6 +202,15 @@ class Deduplicator:
         self._seen[sig] = canonical_params(params)
         return sig
 
+    def discard(self, sig: str) -> None:
+        """Forget an accepted signature whose problem was never emitted.
+
+        For a driver that accepts a problem and then fails to emit it without
+        aborting the run: the signature must be released, or a later, correct copy of
+        the same problem is reported as a duplicate of one that does not exist.
+        """
+        self._seen.pop(sig, None)
+
     def first_with(self, sig: str) -> Optional[ParamsInput]:
         """The params that originally claimed ``sig``, for explaining a collision."""
         return self._seen.get(sig)
