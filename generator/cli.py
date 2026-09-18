@@ -527,6 +527,9 @@ def _structured_row(
         return RowOutcome(row.line, row.input_id, row.family, "input_error", row.reason)
 
     family = registry.get(row.family)
+    # TODO: revisit the wording of the rejection and warning messages (e.g. "inner
+    # polygon does not fit with clearance") once --from-file has run on the real
+    # hand-sourced problem set and we can see which messages actually fire.
     blocking, warnings = registry.classify_issues(family, row.params)
     outcome = RowOutcome(row.line, row.input_id, row.family, "emitted", warnings=warnings)
     if blocking is not None:

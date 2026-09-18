@@ -18,7 +18,13 @@ from generator.families import inscribed_circle as circ
 from generator.families import nested_polygons as nested
 from generator.params import ParamTypeError, length_text, parse_value
 from generator.schema import Datapoint, SchemaValidationError
-from generator.structured import RowError, StructuredInputError, StructuredProblem, load_rows
+from generator.structured import (
+    RowError,
+    StructuredInputError,
+    StructuredProblem,
+    load_rows,
+    parse_expected_answer,
+)
 from generator.verify import verify
 
 REPO = Path(__file__).resolve().parent.parent
@@ -269,6 +275,43 @@ def test_bad_rows_are_reported_individually(tmp_path, row, reason):
     rows = load_rows(write_rows(tmp_path / "p.jsonl", [row, {**GOOD_ROW, "input_id": "ok"}]))
     assert isinstance(rows[0], RowError) and reason in rows[0].reason, rows[0]
     assert isinstance(rows[1], StructuredProblem)
+
+
+def test_expected_answer_parses_exactly_as_sympify_for_the_examples():
+    for line in EXAMPLES.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            text = json.loads(line)["expected_answer"]
+            assert parse_expected_answer(text) == sp.sympify(text), text
+
+
+@pytest.mark.parametrize("text", ["2^3", "2**3", "Rational(25, 4)", "E", "cbrt(27)", ".5 + 1.", "-sqrt(2)"])
+def test_expected_answer_accepts_the_documented_forms(text):
+    assert parse_expected_answer(text) == sp.sympify(text)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "Integer(__import__('pathlib').Path({marker!r}).write_text('x'))",
+        "__import__('pathlib').Path({marker!r}).write_text('x') or 1",
+        "().__class__.__base__.__subclasses__()",
+        "(1).real",
+        "[1][0]",
+        "1 if 1 else 2",
+        "(lambda: 1)()",
+    ],
+)
+def test_expected_answer_is_never_run_as_python(tmp_path, template):
+    marker = tmp_path / "executed"
+    with pytest.raises(ValueError, match="does not parse"):
+        parse_expected_answer(template.format(marker=str(marker)))
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("text", ["foo(2)", "sqrt(2) + y", "max(1, 2)", "len(pi)"])
+def test_expected_answer_names_are_allowlisted(text):
+    with pytest.raises(ValueError, match="unknown symbols"):
+        parse_expected_answer(text)
 
 
 def test_duplicate_input_ids_are_reported_on_the_later_row(tmp_path):

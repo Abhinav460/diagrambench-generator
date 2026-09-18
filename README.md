@@ -161,8 +161,9 @@ One JSON object per line:
 
 A bad row (load error, geometry rejection, answer mismatch, or duplicate) is
 reported and skipped, and the run exits `1`. `--report` lists every row as PASS
-or FAIL with its reason. The answer is parsed with sympy's `parse_expr`, which
-evaluates Python, so only load files you would run as code.
+or FAIL with its reason. `expected_answer` is restricted to numbers, arithmetic
+operators and a short list of names (`sqrt`, `cbrt`, `pi`, `E`, `Rational`, ...)
+before sympy parses it, so an input file cannot run code.
 
 ## How it fits together
 
