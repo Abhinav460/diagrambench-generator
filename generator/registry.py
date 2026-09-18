@@ -44,6 +44,7 @@ __all__ = [
     "Issue",
     "READABILITY",
     "available",
+    "ceiling",
     "classify_issues",
     "first_issue",
     "get",
@@ -95,6 +96,13 @@ class Family(Protocol):
     structured (hand-supplied) input: ``PARAM_TYPES``, mapping each param name to a
     kind in ``generator.params``, and ``validation_issues(params)``, yielding
     ``(GEOMETRY | READABILITY, reason)`` pairs in the order ``is_valid`` checks them.
+
+    A third, ``parameter_space()``, yields every raw parameter set ``sample`` can
+    draw. Define it when the space is small enough to walk in well under a second;
+    ``ceiling`` then knows how many distinct problems the family has, and a run
+    asking for more is warned up front and stopped once it has them all. Leave it
+    undefined for a space too large to enumerate, and the driver falls back to a
+    runtime duplicate-streak guard.
     """
 
     NAME: str
@@ -179,6 +187,33 @@ def classify_issues(family: Any, params: Params) -> tuple[Optional[str], list[st
             )
         warnings.append(reason)
     return None, warnings
+
+
+_CEILINGS: dict[tuple[str, int], int] = {}
+
+
+def ceiling(family: Any, *, precision: int = 6) -> Optional[int]:
+    """How many distinct valid problems ``family`` can ever emit, or ``None`` if unknown.
+
+    Walks the family's optional ``parameter_space()`` and counts the members that
+    pass ``is_valid``, distinct under the dedupe signature at ``precision`` so two
+    raw parameter sets the run would treat as one problem are counted once. Cached
+    per family and precision: the space is fixed for the life of the process, and
+    the walk costs up to half a second for the larger families.
+    """
+    space = getattr(family, "parameter_space", None)
+    if space is None:
+        return None
+    key = (family.NAME, precision)
+    if key not in _CEILINGS:
+        from generator.dedupe import signature  # local: dedupe must stay importable without the registry
+
+        seen: set[str] = set()
+        for params in space():
+            if rejection_reason(family.is_valid(params)) is None:
+                seen.add(signature(family.NAME, params, precision=precision))
+        _CEILINGS[key] = len(seen)
+    return _CEILINGS[key]
 
 
 def rejection_reason(result: ValidationResult) -> Optional[str]:

@@ -109,6 +109,16 @@ def sample(rng: RNG) -> Params:
     }
 
 
+def parameter_space() -> Iterator[Params]:
+    """Every parameter set ``sample`` can draw, unfiltered; ``registry.ceiling`` counts
+    the valid ones so a run can be told when it asks for more than the family has."""
+    for width in range(MIN_SIDE, MAX_SIDE + 1):
+        for height in range(MIN_SIDE, MAX_SIDE + 1):
+            for notch_w in range(1, width):
+                for notch_h in range(1, height):
+                    yield {"width": width, "height": height, "notch_w": notch_w, "notch_h": notch_h}
+
+
 def validation_issues(params: Params) -> Iterator[Issue]:
     """Every problem with ``params``, by severity, in the order ``is_valid`` checks.
 

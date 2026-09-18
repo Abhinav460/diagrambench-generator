@@ -87,6 +87,13 @@ __all__ = [
 #: enough that a healthy family never reaches it.
 DEFAULT_DRAW_MULTIPLIER = 200
 
+#: For a family whose ceiling is unknown (no ``parameter_space``): stop once this many
+#: consecutive draws have produced no new problem, rather than burning draws silently
+#: until ``max_draws``. Families with a known ceiling are stopped by the ceiling
+#: instead; a streak guard would misfire on them, since the last few problems of a
+#: near-exhausted space routinely take more than this many draws to turn up.
+DUPLICATE_STREAK_LIMIT = 5000
+
 
 class AnswerMismatch(ValueError):
     """The family's answer disagrees with a structured row's known answer.
@@ -138,6 +145,10 @@ class RunStats:
     rows: list[RowOutcome] = field(default_factory=list)
     readability_warnings: Counter = field(default_factory=Counter)
     structured: bool = False
+    #: Each drawn family's number of distinct valid problems, or ``None`` if unknown.
+    ceilings: dict[str, Optional[int]] = field(default_factory=dict)
+    #: Why the loop stopped before ``requested``, when it stopped for a known reason.
+    stopped_early: Optional[str] = None
 
     @property
     def acceptance_rate(self) -> float:
@@ -164,6 +175,18 @@ class RunStats:
             f"emitted               : {self.emitted}/{self.requested}"
             + ("" if self.complete else "   *** SHORT ***"),
             f"draws                 : {self.draws}",
+        ]
+        if self.ceilings:
+            lines.append(
+                "ceiling               : "
+                + ", ".join(
+                    f"{name} {'unknown' if limit is None else limit}"
+                    for name, limit in sorted(self.ceilings.items())
+                )
+            )
+        if self.stopped_early:
+            lines.append(f"stopped early         : {self.stopped_early}")
+        lines += [
             f"acceptance rate       : {self.acceptance_rate:.1%} "
             f"({self.draws - self.invalid} valid, {self.invalid} rejected)",
             f"collision rate        : {self.collision_rate:.1%} "
@@ -348,8 +371,30 @@ def generate(
     ceiling = max_draws if max_draws is not None else n * DEFAULT_DRAW_MULTIPLIER
     out_dir = Path(out_dir)
 
+    limit = registry.ceiling(family, precision=precision)
+    stats.ceilings[family_name] = limit
+    if limit is not None and n > limit:
+        _warn(
+            f"{family_name} has {limit} unique valid combinations; n={n} requested "
+            f"-- will emit at most {limit} and then stop"
+        )
+    streak = 0  # consecutive draws that emitted nothing; only consulted when limit is None
+
     with ManifestWriter(out_dir, overwrite=overwrite) as writer:
         while stats.emitted < n and stats.draws < ceiling:
+            if limit is not None and stats.emitted >= limit:
+                stats.stopped_early = (
+                    f"{family_name} has emitted all {limit} of its unique valid "
+                    f"combinations; stopping at {stats.emitted}/{n} emitted"
+                )
+                break
+            if limit is None and streak >= DUPLICATE_STREAK_LIMIT:
+                stats.stopped_early = (
+                    f"no new unique problems found after {streak} consecutive duplicate "
+                    f"or rejected draws; stopping early at {stats.emitted}/{n} emitted"
+                )
+                break
+
             stats.draws += 1
             params = family.sample(rng)
 
@@ -357,6 +402,7 @@ def generate(
             if reason is not None:
                 stats.invalid += 1
                 stats.rejection_reasons[_reason_key(reason)] += 1
+                streak += 1
                 continue
 
             record = _emit_problem(
@@ -370,7 +416,9 @@ def generate(
                 seed=seed,
             )
             if record is None:
+                streak += 1
                 continue
+            streak = 0
 
             if progress_every and stats.emitted % progress_every == 0:
                 print(
@@ -380,6 +428,11 @@ def generate(
                 )
 
     return stats
+
+
+def _warn(message: str) -> None:
+    """Print a run-level warning to stderr, where progress also goes, before the run starts."""
+    print(f"warning: {message}", file=sys.stderr, flush=True)
 
 
 def generate_mixed(
@@ -413,22 +466,50 @@ def generate_mixed(
         for name in family_names
     }
     counters = {name: 0 for name in family_names}
-    exhausted: set[str] = set()
+    exhausted: dict[str, str] = {}  # family -> why it stopped being drawn from
 
     dedupe = Deduplicator(precision=precision)
     stats = RunStats(family="+".join(family_names), seed=seed, requested=n)
     ceiling = max_draws if max_draws is not None else n * DEFAULT_DRAW_MULTIPLIER
     out_dir = Path(out_dir)
 
+    limits = {name: registry.ceiling(families[name], precision=precision) for name in family_names}
+    stats.ceilings.update(limits)
+    share = -(-n // len(family_names))  # ceil: the even split the round-robin aims for
+    for name, limit in limits.items():
+        if limit is not None and limit < share:
+            _warn(
+                f"{name} has {limit} unique valid combinations; its even share of n={n} "
+                f"across {len(family_names)} families is {share} -- will emit at most "
+                f"{limit} from it and let the other families fill the rest"
+            )
+    streaks = {name: 0 for name in family_names}
+
     with ManifestWriter(out_dir, overwrite=overwrite) as writer:
         order = list(family_names)
         position = 0
         while stats.emitted < n and stats.draws < ceiling:
             if len(exhausted) == len(order):
+                stats.stopped_early = (
+                    "every family is exhausted ("
+                    + "; ".join(exhausted[name] for name in order)
+                    + f"); stopping at {stats.emitted}/{n} emitted"
+                )
                 break
             name = order[position % len(order)]
             position += 1
             if name in exhausted:
+                continue
+
+            limit = limits[name]
+            if limit is not None and stats.per_family[name] >= limit:
+                exhausted[name] = f"{name} has emitted all {limit} of its unique valid combinations"
+                continue
+            if limit is None and streaks[name] >= DUPLICATE_STREAK_LIMIT:
+                exhausted[name] = (
+                    f"{name} found no new unique problem in {streaks[name]} consecutive "
+                    f"duplicate or rejected draws"
+                )
                 continue
 
             family = families[name]
@@ -439,6 +520,7 @@ def generate_mixed(
             if reason is not None:
                 stats.invalid += 1
                 stats.rejection_reasons[f"[{name}] {_reason_key(reason)}"] += 1
+                streaks[name] += 1
                 continue
 
             def next_problem_id(name: str = name) -> str:
@@ -457,7 +539,9 @@ def generate_mixed(
                 seed=seed,
             )
             if record is None:
+                streaks[name] += 1
                 continue
+            streaks[name] = 0
 
             if progress_every and stats.emitted % progress_every == 0:
                 print(f"  {stats.emitted}/{n} emitted ({stats.draws} draws)", file=sys.stderr, flush=True)
@@ -683,12 +767,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(stats.report())
 
     if not stats.complete:
-        print(
-            f"stopped after {stats.draws} draws with {stats.emitted}/{stats.requested} "
-            f"emitted. The parameter space may be smaller than the request; raise "
-            f"--max-draws or lower --n.",
-            file=sys.stderr,
-        )
+        if stats.stopped_early:
+            print(f"stopped early: {stats.stopped_early}", file=sys.stderr)
+        else:
+            print(
+                f"stopped after {stats.draws} draws with {stats.emitted}/{stats.requested} "
+                f"emitted. The parameter space may be smaller than the request; raise "
+                f"--max-draws or lower --n.",
+                file=sys.stderr,
+            )
         return 2
     return 0
 

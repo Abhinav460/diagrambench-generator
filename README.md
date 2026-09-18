@@ -67,7 +67,7 @@ records = list(read_manifest("runs/dev", strict=False))  # tolerate a killed run
 | Flag | Default | What it does |
 |---|---|---|
 | `--family` | `nested_polygons` | Which family to draw from, or `all` to spread the run across every registered family. `--list-families` shows what is registered. |
-| `--n` | `10` | How many problems to emit. The run stops early rather than looping forever if the space is exhausted. |
+| `--n` | `10` | How many problems to emit. Asking for more than a family has warns up front and stops once every unique problem is emitted; see "Ceilings" below. |
 | `--seed` | `0` | RNG seed. Seed + `generator_version` reproduces a run byte for byte. |
 | `--out` | required | Output directory. Refuses to overwrite an existing manifest. |
 | `--report` | off | Print the run statistics at the end. |
@@ -82,6 +82,22 @@ Exit codes: `0` reached `--n`; `1` a real failure (verification disagreement, or
 unwritable output directory); `2` ran out of draws short of `--n`. A short run is
 separated from a failed one because it is a normal outcome for a small family, and
 a script running a sweep needs to tell them apart.
+
+### Ceilings
+
+A family can only ever emit as many problems as it has distinct valid parameter
+sets. Three families expose that number by defining `parameter_space()`
+(`registry.ceiling` counts the valid, dedupe-distinct members once per process):
+`inscribed_circle` 120, `nested_polygons` 9,334, `composite_rectilinear` 11,449.
+A run asking for more prints `warning: <family> has <ceiling> unique valid
+combinations; n=<n> requested -- will emit at most <ceiling> and then stop` before
+drawing, stops the moment the ceiling is emitted, and exits `2` with `stopped early:
+...` on stderr (the report carries the same line). `coordinate_polygon`'s space is
+too large to walk, so it is guarded at runtime instead: after 5,000 consecutive
+draws that emit nothing it stops with `no new unique problems found after 5000
+consecutive duplicate or rejected draws; stopping early at <x>/<n> emitted`. With
+`--family all`, a family at its ceiling drops out of the round-robin and the others
+fill the rest.
 
 ### Reading the report
 
