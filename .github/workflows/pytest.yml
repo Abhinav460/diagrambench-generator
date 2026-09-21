@@ -1,0 +1,31 @@
+name: Pytest
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  pytest:
+    name: Full pytest suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python3 -m pip install -r requirements.txt --break-system-packages
+
+      - name: Run full test suite (14 minute limit)
+        run: |
+          set -o pipefail
+          timeout --verbose --kill-after=60s 14m python3 -m pytest -q
