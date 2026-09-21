@@ -11,6 +11,7 @@ test_run*/
 visual_check/
 contact_sheet.png
 *.zip
+reference-dataset/
 
 # Scraped third-party content (harvest scripts are tracked)
 generator/harvest/*.html
