@@ -353,3 +353,20 @@ def test_the_families_produce_different_answer_shapes():
     assert circle_answer.has(sp.pi)
     assert composite_answer.is_Integer
     assert coordinate_answer.is_Rational and not coordinate_answer.is_Integer
+
+
+@pytest.mark.parametrize("family", ALL_NEW, ids=lambda f: f.NAME)
+def test_fifty_problem_end_to_end_run_renders_and_verifies(family, tmp_path):
+    """A bounded production-sized run catches generator hangs missed by unit tests."""
+    from generator.cli import generate
+    from generator.emit import read_manifest
+
+    out = tmp_path / family.NAME
+    stats = generate(family.NAME, 50, 20260921, out)
+    records = list(read_manifest(out))
+
+    assert stats.complete
+    assert stats.emitted == 50
+    assert len(records) == 50
+    assert all((out / record.image_path).is_file() for record in records)
+    assert stats.worst_relative_difference < TOLERANCE
