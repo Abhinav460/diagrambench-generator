@@ -28,6 +28,16 @@ from generator.verify import ARC_TOLERANCE, TOLERANCE, verify
 
 ALL_NEW = [circ, comp, coord]
 
+#: The worst relative difference each family's end-to-end run may report. Polygon
+#: families measure exactly (0.0 in practice); inscribed_circle is measured against a
+#: 4096-segment polygon standing in for its circle, so it gets the same ARC_TOLERANCE
+#: that ``verify`` applies to any curved spec. Worst observed: 7.2e-6.
+RUN_TOLERANCE = {
+    circ.NAME: ARC_TOLERANCE,
+    comp.NAME: TOLERANCE,
+    coord.NAME: TOLERANCE,
+}
+
 
 # --- inscribed_circle: hand-worked closed forms ----------------------------
 
@@ -369,4 +379,4 @@ def test_fifty_problem_end_to_end_run_renders_and_verifies(family, tmp_path):
     assert stats.emitted == 50
     assert len(records) == 50
     assert all((out / record.image_path).is_file() for record in records)
-    assert stats.worst_relative_difference < TOLERANCE
+    assert stats.worst_relative_difference < RUN_TOLERANCE[family.NAME]
