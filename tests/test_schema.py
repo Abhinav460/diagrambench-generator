@@ -9,6 +9,7 @@ import math
 import pytest
 
 from generator.schema import (
+    PAPER_PROBLEM_COUNT,
     Datapoint,
     SchemaValidationError,
     canonical_params,
@@ -180,3 +181,110 @@ def test_canonical_params_is_idempotent():
 def test_canonical_params_rejects_duplicate_keys():
     with pytest.raises(SchemaValidationError, match="duplicate param keys"):
         canonical_params((("n", 1), ("n", 2)))
+
+
+# --- origin="given": one of the paper's problems, packaged as published ----------
+
+
+def make_given(**overrides) -> Datapoint:
+    """A valid given record: no generator provenance, identified by paper_index."""
+    base = dict(
+        problem_id="paper_017",
+        family="given",
+        category=1,
+        stem="Find the area of the shaded region.",
+        image_path="images/paper_017.png",
+        answer_exact="3*sqrt(3)/2",
+        answer_decimal=2.598076211353316,
+        origin="given",
+        paper_index=17,
+        answer_type="exact",
+    )
+    base.update(overrides)
+    return Datapoint(**base)
+
+
+def test_a_given_record_validates_and_round_trips():
+    dp = make_given(source_image="IMG_0417.png")
+    dp.validate()
+    assert Datapoint.from_json(dp.to_json()) == dp
+
+
+def test_a_given_record_serializes_its_fields_and_other_origins_do_not():
+    assert {"paper_index", "answer_type"} <= set(make_given().to_dict())
+    assert "source_image" not in make_given().to_dict()
+    assert not {"paper_index", "source_image", "answer_type"} & set(make().to_dict())
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("seed", 0), ("params", {"n": 6}), ("signature", "abc"), ("generator_version", "0.2.0")],
+)
+def test_a_given_record_rejects_generator_provenance(field, value):
+    with pytest.raises(SchemaValidationError, match="origin='given' has no generator provenance"):
+        make_given(**{field: value}).validate()
+
+
+@pytest.mark.parametrize("bad", [None, 0, PAPER_PROBLEM_COUNT + 1, -1, True, 17.0, "17"])
+def test_a_given_record_requires_paper_index_in_range(bad):
+    with pytest.raises(SchemaValidationError, match="paper_index"):
+        make_given(paper_index=bad).validate()
+
+
+@pytest.mark.parametrize("index", [1, PAPER_PROBLEM_COUNT])
+def test_paper_index_bounds_are_inclusive(index):
+    make_given(paper_index=index).validate()
+
+
+@pytest.mark.parametrize("bad", [None, "proof", ""])
+def test_a_given_record_requires_a_known_answer_type(bad):
+    with pytest.raises(SchemaValidationError, match="answer_type"):
+        make_given(answer_type=bad).validate()
+
+
+@pytest.mark.parametrize("bad", ["", "   ", 7])
+def test_source_image_must_be_a_non_empty_string_when_set(bad):
+    with pytest.raises(SchemaValidationError, match="source_image"):
+        make_given(source_image=bad).validate()
+
+
+def test_an_unavailable_answer_leaves_both_answer_fields_empty():
+    dp = make_given(answer_type="unavailable", answer_exact=None, answer_decimal=None)
+    dp.validate()
+    assert Datapoint.from_json(dp.to_json()) == dp
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"answer_exact": "3", "answer_decimal": None}, {"answer_exact": None, "answer_decimal": 3.0}],
+)
+def test_an_unavailable_answer_rejects_a_stray_value(overrides):
+    with pytest.raises(SchemaValidationError, match="answer_type='unavailable' means there is no answer"):
+        make_given(answer_type="unavailable", **overrides).validate()
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"answer_exact": None}, "answer_exact must be a non-empty string"),
+        ({"answer_decimal": None}, "answer_decimal must be a real number"),
+        ({"answer_decimal": 0}, "answer_decimal is zero"),
+    ],
+)
+def test_an_exact_given_answer_is_checked_like_any_other(overrides, match):
+    with pytest.raises(SchemaValidationError, match=match):
+        make_given(**overrides).validate()
+
+
+@pytest.mark.parametrize("origin", ["generated", "harvested"])
+def test_only_given_records_may_omit_the_answer(origin):
+    with pytest.raises(SchemaValidationError, match="answer_exact must be a non-empty string"):
+        make(origin=origin, answer_exact=None, answer_decimal=None, answer_type="unavailable").validate()
+
+
+def test_answer_fields_stay_required_keys_even_when_empty():
+    """Nullable is not omittable: a manifest line without answer_exact is malformed."""
+    payload = make_given(answer_type="unavailable", answer_exact=None, answer_decimal=None).to_dict()
+    del payload["answer_exact"]
+    with pytest.raises(SchemaValidationError, match="missing required fields"):
+        Datapoint.from_dict(payload)
