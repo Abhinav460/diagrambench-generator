@@ -30,6 +30,28 @@ JSONL, one problem per line; blank lines are skipped::
   ``original_answer``, ``retrieved_at``, copied into the record's provenance fields.
 - ``notes`` (optional): free text, not emitted.
 
+Seeded rows
+-----------
+A row with ``variants`` asks for that many new problems *like* a partly specified
+one, instead of the one problem it names::
+
+    {"input_id": "hex_ring", "family": "inscribed_circle", "params": {"k": 6},
+     "variants": 20}
+
+- ``params`` may name any subset of the family's keys, including none. Those values
+  are pinned; the rest are drawn by the family's own ``sample``, conditioned on the
+  pins, from a stream derived from the run's ``--seed`` and the row's ``input_id``.
+- ``variants`` (required for a seeded row): a positive integer. The variants are
+  emitted as ``<input_id>_000``, ``<input_id>_001``, ...
+- ``readability`` (optional, seeded rows only): ``"block"`` (default) rejects a draw
+  on any issue, exactly as a random draw is; ``"warn"`` blocks only geometry issues,
+  for pins no random draw would produce, such as a hexagon inside a square.
+- ``expected_answer`` is not allowed: each variant has its own answer, verified the
+  way a random draw's is. To check that a family models a source problem, add the
+  source as an ordinary row in the same file.
+- The family must support pinning (``registry.supports_pinning``);
+  ``coordinate_polygon`` does not yet.
+
 ``expected_answer`` is checked token by token before sympy sees it: only numbers,
 the operators ``+ - * / ^ ** ( ) ,`` and the names in ``ANSWER_NAMES`` are allowed,
 and the parse then runs with no builtins in scope. An input file cannot run code.
@@ -46,12 +68,12 @@ import keyword
 import math
 import re
 import tokenize
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 from generator import registry
-from generator.params import parse_params
+from generator.params import parse_params, parse_value
 
 if TYPE_CHECKING:
     from sympy import Expr
@@ -69,6 +91,9 @@ __all__ = [
 
 REQUIRED_KEYS = ("input_id", "family", "params", "expected_answer")
 OPTIONAL_KEYS = ("source", "notes")
+#: Keys only a seeded row (one with ``variants``) may carry. ``expected_answer`` is
+#: required on every other row and forbidden on a seeded one.
+SEEDED_KEYS = ("variants", "readability")
 
 #: ``source`` key -> ``Datapoint`` field.
 SOURCE_FIELDS = {
@@ -101,9 +126,24 @@ class StructuredProblem:
     input_id: str
     family: str
     params: dict[str, Any]
-    expected_answer: str
+    #: ``None`` exactly when the row is seeded.
+    expected_answer: Optional[str]
     source: dict[str, str] = field(default_factory=dict)
     notes: Optional[str] = None
+    #: How many variants a seeded row asks for; ``None`` for an ordinary row.
+    variants: Optional[int] = None
+    readability: str = "block"
+
+    @property
+    def seeded(self) -> bool:
+        return self.variants is not None
+
+    def variant_ids(self) -> list[str]:
+        """The ``problem_id`` of each variant a seeded row can emit, in order."""
+        if self.variants is None:
+            return []
+        width = max(3, len(str(self.variants - 1)))
+        return [f"{self.input_id}_{index:0{width}d}" for index in range(self.variants)]
 
     def provenance(self) -> dict[str, str]:
         """The ``source`` block as ``Datapoint`` keyword arguments."""
@@ -195,15 +235,32 @@ def parse_expected_answer(text: str) -> Expr:
     return expr
 
 
-def _check_row(data: Any, seen_ids: set[str]) -> Union[tuple[str, str, dict, str, dict, Optional[str]], str]:
-    """The row's fields, or the first reason it cannot be loaded."""
+def _check_row(data: Any, seen_ids: set[str]) -> Union[StructuredProblem, str]:
+    """The row as loaded (``line`` left 0), or the first reason it cannot be loaded."""
     if not isinstance(data, dict):
         return f"row must be a JSON object; got {type(data).__name__}"
 
-    unknown = sorted(set(data) - set(REQUIRED_KEYS) - set(OPTIONAL_KEYS))
+    allowed = REQUIRED_KEYS + OPTIONAL_KEYS + SEEDED_KEYS
+    unknown = sorted(set(data) - set(allowed))
     if unknown:
-        return f"unknown keys {unknown}; allowed: {list(REQUIRED_KEYS + OPTIONAL_KEYS)}"
-    missing = [key for key in REQUIRED_KEYS if key not in data]
+        return f"unknown keys {unknown}; allowed: {list(allowed)}"
+    seeded = "variants" in data
+    if seeded:
+        if "expected_answer" in data:
+            return (
+                "a seeded row (one with variants) cannot carry expected_answer: each "
+                "variant has its own answer. Add the source problem as its own row to "
+                "check it"
+            )
+        required: tuple[str, ...] = tuple(key for key in REQUIRED_KEYS if key != "expected_answer")
+    else:
+        if "readability" in data:
+            return (
+                "readability applies only to seeded rows (ones with variants); an "
+                "ordinary row's readability issues are always warnings"
+            )
+        required = REQUIRED_KEYS
+    missing = [key for key in required if key not in data]
     if missing:
         return f"missing required keys {missing}"
 
@@ -231,24 +288,49 @@ def _check_row(data: Any, seen_ids: set[str]) -> Union[tuple[str, str, dict, str
     if not isinstance(params, dict):
         return f"params must be a JSON object; got {type(params).__name__}"
     expected_keys, actual_keys = set(param_types), set(params)
-    if expected_keys != actual_keys:
-        return (
-            f"params for {family_name!r} must have exactly the keys {sorted(expected_keys)}; "
-            f"missing {sorted(expected_keys - actual_keys)}, "
-            f"unexpected {sorted(actual_keys - expected_keys)}"
-        )
-    try:
-        parse_params(param_types, params)
-    except ValueError as exc:
-        return f"params: {exc}"
+    if seeded:
+        if not registry.supports_pinning(family):
+            return f"family {family_name!r} does not support seeded rows (variants) yet"
+        if not actual_keys <= expected_keys:
+            return (
+                f"params of a seeded row for {family_name!r} must be a subset of "
+                f"{sorted(expected_keys)}; unexpected {sorted(actual_keys - expected_keys)}"
+            )
+        try:
+            for name, value in params.items():
+                parse_value(param_types[name], name, value)
+        except ValueError as exc:
+            return f"params: {exc}"
+    else:
+        if expected_keys != actual_keys:
+            return (
+                f"params for {family_name!r} must have exactly the keys {sorted(expected_keys)}; "
+                f"missing {sorted(expected_keys - actual_keys)}, "
+                f"unexpected {sorted(actual_keys - expected_keys)}"
+            )
+        try:
+            parse_params(param_types, params)
+        except ValueError as exc:
+            return f"params: {exc}"
 
-    expected = data["expected_answer"]
-    if not isinstance(expected, str) or not expected.strip():
-        return f"expected_answer must be a non-empty string; got {expected!r}"
-    try:
-        parse_expected_answer(expected)
-    except ValueError as exc:
-        return str(exc)
+    expected: Optional[str] = None
+    variants: Optional[int] = None
+    readability = "block"
+    if seeded:
+        variants = data["variants"]
+        if isinstance(variants, bool) or not isinstance(variants, int) or variants < 1:
+            return f"variants must be a positive integer; got {variants!r}"
+        readability = data.get("readability", "block")
+        if readability not in registry.READABILITY_MODES:
+            return f"readability must be one of {list(registry.READABILITY_MODES)}; got {readability!r}"
+    else:
+        expected = data["expected_answer"]
+        if not isinstance(expected, str) or not expected.strip():
+            return f"expected_answer must be a non-empty string; got {expected!r}"
+        try:
+            parse_expected_answer(expected)
+        except ValueError as exc:
+            return str(exc)
 
     source = data.get("source", {})
     if not isinstance(source, dict):
@@ -264,7 +346,9 @@ def _check_row(data: Any, seen_ids: set[str]) -> Union[tuple[str, str, dict, str
     if notes is not None and not isinstance(notes, str):
         return f"notes must be a string; got {notes!r}"
 
-    return input_id, family_name, params, expected, source, notes
+    return StructuredProblem(
+        0, input_id, family_name, params, expected, source, notes, variants, readability
+    )
 
 
 def load_rows(path: Path | str) -> list[Union[StructuredProblem, RowError]]:
@@ -300,12 +384,42 @@ def load_rows(path: Path | str) -> list[Union[StructuredProblem, RowError]]:
             )
             continue
 
-        input_id, family_name, params, expected, source, notes = checked
-        seen_ids.add(input_id)
-        rows.append(
-            StructuredProblem(line_number, input_id, family_name, params, expected, source, notes)
-        )
+        seen_ids.add(checked.input_id)
+        rows.append(replace(checked, line=line_number))
 
     if not rows:
         raise StructuredInputError(f"structured input {path} contains no rows")
-    return rows
+    return _reject_id_clashes(rows)
+
+
+def _reject_id_clashes(
+    rows: list[Union[StructuredProblem, RowError]],
+) -> list[Union[StructuredProblem, RowError]]:
+    """Turn any row whose output ids clash with an earlier row's into a ``RowError``.
+
+    ``input_id`` is unique by construction, but a seeded row ``hex`` emits
+    ``hex_000``, which an ordinary row may also be called. Both would write the same
+    image, so the later row is rejected before anything runs.
+    """
+    taken: dict[str, str] = {}
+    checked: list[Union[StructuredProblem, RowError]] = []
+    for row in rows:
+        if isinstance(row, RowError):
+            checked.append(row)
+            continue
+        ids = row.variant_ids() if row.seeded else [row.input_id]
+        clash = next((problem_id for problem_id in ids if problem_id in taken), None)
+        if clash is not None:
+            checked.append(
+                RowError(
+                    row.line,
+                    row.input_id,
+                    row.family,
+                    f"output id {clash!r} is already used by row {taken[clash]!r}",
+                )
+            )
+            continue
+        for problem_id in ids:
+            taken[problem_id] = row.input_id
+        checked.append(row)
+    return checked

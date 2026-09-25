@@ -31,7 +31,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator
 from fractions import Fraction
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from numpy.random import Generator as RNG
@@ -122,19 +122,31 @@ def exact_circle_area(k: int, side: int | Fraction) -> Expr:
     return sp.pi * r ** 2
 
 
-def sample(rng: RNG) -> Params:
-    """Draw a side count and an integer side length."""
-    return {
-        "k": int(rng.integers(MIN_SIDES, MAX_SIDES + 1)),
-        "side": int(rng.integers(MIN_SIDE_LENGTH, MAX_SIDE_LENGTH + 1)),
-    }
+def sample(rng: RNG, pinned: Optional[Params] = None) -> Params:
+    """Draw a side count and an integer side length.
+
+    A key in ``pinned`` is taken as given and not drawn, so an empty ``pinned``
+    consumes ``rng`` exactly as a plain draw does.
+    """
+    pinned = pinned or {}
+    k = pinned["k"] if "k" in pinned else int(rng.integers(MIN_SIDES, MAX_SIDES + 1))
+    side = (
+        pinned["side"]
+        if "side" in pinned
+        else int(rng.integers(MIN_SIDE_LENGTH, MAX_SIDE_LENGTH + 1))
+    )
+    return {"k": k, "side": side}
 
 
-def parameter_space() -> Iterator[Params]:
-    """Every parameter set ``sample`` can draw, unfiltered; ``registry.ceiling`` counts
-    the valid ones so a run can be told when it asks for more than the family has."""
-    for k in range(MIN_SIDES, MAX_SIDES + 1):
-        for side in range(MIN_SIDE_LENGTH, MAX_SIDE_LENGTH + 1):
+def parameter_space(pinned: Optional[Params] = None) -> Iterator[Params]:
+    """Every parameter set ``sample`` can draw with ``pinned``, unfiltered;
+    ``registry.ceiling`` counts the valid ones so a run can be told when it asks for
+    more than the family has."""
+    pinned = pinned or {}
+    for k in [pinned["k"]] if "k" in pinned else range(MIN_SIDES, MAX_SIDES + 1):
+        for side in (
+            [pinned["side"]] if "side" in pinned else range(MIN_SIDE_LENGTH, MAX_SIDE_LENGTH + 1)
+        ):
             yield {"k": k, "side": side}
 
 

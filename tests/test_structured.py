@@ -420,7 +420,7 @@ def test_cli_from_file_reports_an_unreadable_file(tmp_path, capsys):
 
 
 @pytest.mark.parametrize(
-    "extra", [["--n", "10"], ["--seed", "0"], ["--family", "nested_polygons"], ["--max-draws", "5"]]
+    "extra", [["--n", "10"], ["--family", "nested_polygons"], ["--max-draws", "5"]]
 )
 def test_cli_from_file_refuses_draw_only_options_even_at_their_defaults(tmp_path, extra):
     with pytest.raises(SystemExit):

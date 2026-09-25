@@ -63,17 +63,20 @@ __all__ = [
     "stem_leaks_geometry",
 ]
 
-Origin = Literal["generated", "harvested", "structured"]
+Origin = Literal["generated", "harvested", "structured", "seeded"]
 
 #: Every accepted ``origin``. ``structured`` is a real problem entered by hand as a
 #: family's params: it has params and a signature like a generated record, no seed
 #: because nothing was drawn, and a known answer to check the family against.
-ORIGINS = ("generated", "harvested", "structured")
+#: ``seeded`` is a variant of a partly specified problem: the params in ``pinned``
+#: were given by hand and the rest drawn from ``seed``, so it has a seed and no
+#: known answer.
+ORIGINS = ("generated", "harvested", "structured", "seeded")
 
 #: Fields added after the manifest format was fixed, omitted from ``to_dict`` while
 #: unset so that records of the existing origins serialize byte-identically to the
 #: manifests already on disk.
-_OMIT_WHEN_NONE = frozenset({"expected_answer"})
+_OMIT_WHEN_NONE = frozenset({"expected_answer", "parent_input_id", "pinned"})
 
 #: 1 = diagram-dependent, 2 = textual. The paper's two-category structure, and the
 #: variable its central claim is measured against, so it belongs in the record
@@ -227,8 +230,9 @@ class Datapoint:
     answer_decimal: float
     origin: Origin
 
-    # Procedural-generation provenance. Required for origin="generated", required
-    # bar the seed for origin="structured", and None for origin="harvested": a
+    # Procedural-generation provenance. Required for origin="generated" and
+    # origin="seeded", required bar the seed for origin="structured", and None for
+    # origin="harvested": a
     # harvested problem was not drawn from a
     # parameter space, so it has no seed, no params, and no generator version to
     # record, and a dedupe signature over absent params would be a fiction.
@@ -253,12 +257,20 @@ class Datapoint:
     # ``answer_exact`` against before emitting. Optional and unset for the others.
     expected_answer: Optional[str] = None
 
+    # Seeded-input provenance. Required for origin="seeded": the ``input_id`` of the
+    # row the variant was drawn for, and the params that row held fixed (possibly
+    # none). The seeded row's stream is derived from ``seed`` and ``parent_input_id``.
+    parent_input_id: Optional[str] = None
+    pinned: Optional[ParamsInput] = None
+
     def __post_init__(self) -> None:
         # Canonicalize on the way in so callers may pass a dict while storage
         # stays hashable. object.__setattr__ is the standard escape hatch for
         # normalizing a field on a frozen dataclass.
         if self.params is not None:
             object.__setattr__(self, "params", canonical_params(self.params))
+        if self.pinned is not None:
+            object.__setattr__(self, "pinned", canonical_params(self.pinned))
 
     @property
     def params_dict(self) -> dict[str, Any]:
@@ -368,6 +380,37 @@ class Datapoint:
                 )
             self._validate_structured_param_keys()
 
+        elif self.origin == "seeded":
+            required = generator_only + ("parent_input_id", "pinned")
+            missing = [name for name in required if getattr(self, name) is None]
+            if missing:
+                raise SchemaValidationError(
+                    f"origin='seeded' requires {required}; missing {missing}"
+                )
+            for name in ("signature", "generator_version", "parent_input_id"):
+                value = getattr(self, name)
+                if not isinstance(value, str) or not value.strip():
+                    raise SchemaValidationError(
+                        f"{name} must be a non-empty string; got {value!r}"
+                    )
+            if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+                raise SchemaValidationError(f"seed must be an int; got {self.seed!r}")
+            # A variant's answer is computed, never known in advance; carrying one
+            # would claim a check against a source that did not happen.
+            if self.expected_answer is not None:
+                raise SchemaValidationError(
+                    "origin='seeded' has no known answer; got "
+                    f"expected_answer={self.expected_answer!r}"
+                )
+            self._validate_structured_param_keys()
+            params = dict(self.params)  # type: ignore[arg-type]
+            for key, value in self.pinned:  # type: ignore[union-attr]
+                if key not in params or params[key] != value:
+                    raise SchemaValidationError(
+                        f"pinned {key}={value!r} does not match params "
+                        f"{key}={params.get(key)!r}"
+                    )
+
     def _validate_structured_param_keys(self) -> None:
         """Require exactly the keys the family's ``solve`` reads.
 
@@ -380,7 +423,7 @@ class Datapoint:
             family = registry.get(self.family)
         except KeyError as exc:
             raise SchemaValidationError(
-                f"origin='structured' needs a registered family; {exc.args[0]}"
+                f"origin={self.origin!r} needs a registered family; {exc.args[0]}"
             ) from None
         param_types = getattr(family, "PARAM_TYPES", None)
         if param_types is None:
@@ -447,7 +490,11 @@ class Datapoint:
             value = getattr(self, f.name)
             if value is None and f.name in _OMIT_WHEN_NONE:
                 continue
-            out[f.name] = self.params_dict if f.name == "params" else value
+            if f.name == "params":
+                value = self.params_dict
+            elif f.name == "pinned" and value is not None:
+                value = {k: _unfreeze(v) for k, v in value}
+            out[f.name] = value
         return out
 
     def to_json(self) -> str:

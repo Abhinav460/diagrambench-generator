@@ -32,9 +32,10 @@ look alike lets a model pattern-match the *form* of an answer rather than derive
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator
 from fractions import Fraction
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from numpy.random import Generator as RNG
@@ -96,26 +97,49 @@ def exact_area(width: Length, height: Length, notch_w: Length, notch_h: Length) 
     return exact(width) * exact(height) - exact(notch_w) * exact(notch_h)
 
 
-def sample(rng: RNG) -> Params:
-    """Draw outer dimensions, then a notch sized as a fraction of each."""
+def _notch_stop(side: Any) -> int:
+    """Exclusive upper bound for a drawn notch: every integer strictly below ``side``.
+
+    ``side`` is an int when drawn, but may be a pinned non-integer length such as
+    12.5. A side of 1 or less leaves no such integer, so the notch is then drawn as 1
+    and left to ``is_valid`` rather than to an empty range.
+    """
+    return max(math.ceil(side), 2)
+
+
+def sample(rng: RNG, pinned: Optional[Params] = None) -> Params:
+    """Draw outer dimensions, then a notch sized as a fraction of each.
+
+    A key in ``pinned`` is taken as given and not drawn, and each notch is drawn
+    against the outer dimension actually used. An empty ``pinned`` consumes ``rng``
+    exactly as a plain draw does.
+    """
     #find the use of the random number generator(rng)
-    width = int(rng.integers(MIN_SIDE, MAX_SIDE + 1))
-    height = int(rng.integers(MIN_SIDE, MAX_SIDE + 1))
-    return {
-        "width": width,
-        "height": height,
-        "notch_w": int(rng.integers(1, width)),
-        "notch_h": int(rng.integers(1, height)),
-    }
+    pinned = pinned or {}
+    values = {}
+    for key in ("width", "height"):
+        values[key] = pinned[key] if key in pinned else int(rng.integers(MIN_SIDE, MAX_SIDE + 1))
+    for key, outer in (("notch_w", "width"), ("notch_h", "height")):
+        values[key] = (
+            pinned[key] if key in pinned else int(rng.integers(1, _notch_stop(values[outer])))
+        )
+    return values
 
 
-def parameter_space() -> Iterator[Params]:
-    """Every parameter set ``sample`` can draw, unfiltered; ``registry.ceiling`` counts
-    the valid ones so a run can be told when it asks for more than the family has."""
-    for width in range(MIN_SIDE, MAX_SIDE + 1):
-        for height in range(MIN_SIDE, MAX_SIDE + 1):
-            for notch_w in range(1, width):
-                for notch_h in range(1, height):
+def parameter_space(pinned: Optional[Params] = None) -> Iterator[Params]:
+    """Every parameter set ``sample`` can draw with ``pinned``, unfiltered;
+    ``registry.ceiling`` counts the valid ones so a run can be told when it asks for
+    more than the family has."""
+    pinned = pinned or {}
+    sides = range(MIN_SIDE, MAX_SIDE + 1)
+    for width in [pinned["width"]] if "width" in pinned else sides:
+        for height in [pinned["height"]] if "height" in pinned else sides:
+            notch_ws = [pinned["notch_w"]] if "notch_w" in pinned else range(1, _notch_stop(width))
+            for notch_w in notch_ws:
+                notch_hs = (
+                    [pinned["notch_h"]] if "notch_h" in pinned else range(1, _notch_stop(height))
+                )
+                for notch_h in notch_hs:
                     yield {"width": width, "height": height, "notch_w": notch_w, "notch_h": notch_h}
 
 

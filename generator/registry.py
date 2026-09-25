@@ -44,12 +44,16 @@ __all__ = [
     "Issue",
     "READABILITY",
     "available",
+    "READABILITY_MODES",
     "ceiling",
     "classify_issues",
+    "draw_verdict",
     "first_issue",
     "get",
     "register",
     "rejection_reason",
+    "supports_pinning",
+    "valid_signatures",
 ]
 
 Params = Mapping[str, Any]
@@ -103,6 +107,10 @@ class Family(Protocol):
     asking for more is warned up front and stopped once it has them all. Leave it
     undefined for a space too large to enumerate, and the driver falls back to a
     runtime duplicate-streak guard.
+
+    A family may also accept seeded structured input (variants of a partly
+    specified problem) by giving ``sample`` and ``parameter_space`` an optional
+    ``pinned`` mapping; see ``supports_pinning``.
     """
 
     NAME: str
@@ -189,10 +197,51 @@ def classify_issues(family: Any, params: Params) -> tuple[Optional[str], list[st
     return None, warnings
 
 
-_CEILINGS: dict[tuple[str, int], int] = {}
+#: How a drawn parameter set's readability issues are treated. ``block`` is the
+#: random-draw rule (``is_valid``: any issue rejects); ``warn`` is the structured-input
+#: rule (``classify_issues``: only geometry rejects), for pins a random draw would
+#: never produce, such as a hexagon inside a square.
+READABILITY_MODES = ("block", "warn")
 
 
-def ceiling(family: Any, *, precision: int = 6) -> Optional[int]:
+def draw_verdict(
+    family: Any, params: Params, readability: str = "block"
+) -> tuple[Optional[str], list[str]]:
+    """``(rejection_reason, readability_warnings)`` for a drawn parameter set.
+
+    With ``block`` this is exactly the random-draw check, ``is_valid``, so plain
+    draws are judged as they always were; warnings are then always empty.
+    """
+    if readability == "block":
+        return rejection_reason(family.is_valid(params)), []
+    if readability == "warn":
+        return classify_issues(family, params)
+    raise ValueError(f"readability must be one of {READABILITY_MODES}; got {readability!r}")
+
+
+def supports_pinning(family: Any) -> bool:
+    """Whether ``family.sample`` takes a ``pinned`` mapping of params to hold fixed.
+
+    Optional, like ``parameter_space``. A family that supports it must also accept
+    ``pinned`` in ``parameter_space`` (if it defines one), yielding exactly what
+    ``sample`` can draw with those pins, so ``ceiling`` stays true for seeded runs.
+    """
+    try:
+        return "pinned" in inspect.signature(family.sample).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+_VALID_SIGNATURES: dict[tuple[Any, ...], frozenset[str]] = {}
+
+
+def ceiling(
+    family: Any,
+    *,
+    precision: int = 6,
+    pinned: Optional[Params] = None,
+    readability: str = "block",
+) -> Optional[int]:
     """How many distinct valid problems ``family`` can ever emit, or ``None`` if unknown.
 
     Walks the family's optional ``parameter_space()`` and counts the members that
@@ -200,20 +249,41 @@ def ceiling(family: Any, *, precision: int = 6) -> Optional[int]:
     raw parameter sets the run would treat as one problem are counted once. Cached
     per family and precision: the space is fixed for the life of the process, and
     the walk costs up to half a second for the larger families.
+
+    With ``pinned``, walks ``parameter_space(pinned)`` instead, and with
+    ``readability="warn"`` counts members that ``draw_verdict`` accepts in that
+    mode: the ceiling of a seeded row rather than of the whole family.
+    """
+    found = valid_signatures(family, precision=precision, pinned=pinned, readability=readability)
+    return None if found is None else len(found)
+
+
+def valid_signatures(
+    family: Any,
+    *,
+    precision: int = 6,
+    pinned: Optional[Params] = None,
+    readability: str = "block",
+) -> Optional[frozenset[str]]:
+    """The dedupe signatures ``ceiling`` counts, or ``None`` if the space is unknown.
+
+    Exposed so a seeded row can subtract the problems earlier rows already emitted.
     """
     space = getattr(family, "parameter_space", None)
     if space is None:
         return None
-    key = (family.NAME, precision)
-    if key not in _CEILINGS:
+    key: tuple[Any, ...] = (family.NAME, precision)
+    if pinned or readability != "block":
+        key += (tuple(sorted((name, repr(value)) for name, value in (pinned or {}).items())), readability)
+    if key not in _VALID_SIGNATURES:
         from generator.dedupe import signature  # local: dedupe must stay importable without the registry
 
         seen: set[str] = set()
-        for params in space():
-            if rejection_reason(family.is_valid(params)) is None:
+        for params in space(pinned) if pinned else space():
+            if draw_verdict(family, params, readability)[0] is None:
                 seen.add(signature(family.NAME, params, precision=precision))
-        _CEILINGS[key] = len(seen)
-    return _CEILINGS[key]
+        _VALID_SIGNATURES[key] = frozenset(seen)
+    return _VALID_SIGNATURES[key]
 
 
 def rejection_reason(result: ValidationResult) -> Optional[str]:

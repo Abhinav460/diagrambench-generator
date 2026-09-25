@@ -8,7 +8,9 @@ Run with::
 The second form skips the random draw: each row of the file names a real problem as
 a family's params, and goes through the same solve/verify/render/emit step a draw
 does (``_emit_problem``), plus a check against the row's known answer. See
-``generator.structured`` for the file format.
+``generator.structured`` for the file format. A row with ``variants`` is seeded instead:
+its params are pinned and the rest drawn from ``--seed``, through the same loop as a
+random run (``_draw_into``).
 
 The loop is the spec's driver, with one structural change: every rejection is
 counted by cause. A run that produces 40 problems from 1000 draws has failed at
@@ -36,14 +38,17 @@ unwritable output directory); ``2`` the run exhausted ``--max-draws`` short of
 for a family whose parameter space is smaller than the request, and a caller
 scripting a sweep needs to tell the two apart.
 
-With ``--from-file``: ``0`` every row was emitted; ``1`` anything else -- a row that
-failed to load, was geometrically invalid, disagreed with its expected answer, or
-duplicated an earlier row, as well as the failures above.
+With ``--from-file``: ``0`` every row was emitted; ``2`` the only shortfall is
+seeded rows that stopped short of their ``variants`` (a pinned space smaller than
+the request, as with ``--n``); ``1`` anything else -- a row that failed to load, was
+geometrically invalid, disagreed with its expected answer, or duplicated an earlier
+row, as well as the failures above.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
@@ -112,11 +117,13 @@ class RowOutcome:
     input_id: Optional[str]
     family: Optional[str]
     #: ``emitted``, ``input_error``, ``geometry_rejected``, ``answer_mismatch``,
-    #: ``duplicate``, or ``error``.
+    #: ``duplicate``, or ``error``; for a seeded row, ``emitted`` or ``short``.
     status: str
     detail: str = ""
     warnings: list[str] = field(default_factory=list)
     answer: Optional[str] = None
+    #: A seeded row's own draw loop: what it asked for and what it got.
+    variants: Optional[RunStats] = None
 
     @property
     def passed(self) -> bool:
@@ -129,7 +136,8 @@ class RunStats:
 
     For a structured-input run, ``draws`` counts rows, ``invalid`` counts rows that
     failed to load or were geometrically invalid, and ``rows`` holds each row's
-    outcome.
+    outcome. ``requested`` counts problems: one per ordinary row, ``variants`` per
+    seeded row, whose draws and rejections are kept on its own ``RowOutcome``.
     """
 
     family: str
@@ -216,9 +224,14 @@ class RunStats:
             f"answer mismatches     : {statuses['answer_mismatch']}",
             f"duplicates            : {statuses['duplicate']}",
             f"other errors          : {statuses['error']}",
+        ]
+        if any(row.variants is not None for row in self.rows):
+            lines.append(f"short seeded rows     : {statuses['short']}")
+        lines += [
             f"verified              : {self.emitted} "
             f"(worst relative difference {self.worst_relative_difference:.2e})",
-            f"readability warnings  : {sum(1 for row in self.rows if row.warnings)} rows",
+            f"readability warnings  : "
+            f"{sum(1 for row in self.rows if row.warnings or (row.variants and row.variants.readability_warnings))} rows",
         ]
         if len(self.per_family) > 1:
             lines.append("emitted by family  :")
@@ -226,10 +239,28 @@ class RunStats:
                 lines.append(f"    {count:6d}  {name}")
         lines.append("rows                  :")
         for row in self.rows:
-            mark = "PASS" if row.passed else "FAIL"
+            mark = "PASS" if row.passed else ("SHORT" if row.status == "short" else "FAIL")
             where = f"line {row.line}  {row.input_id or '<no input_id>'} [{row.family or '?'}]"
-            detail = f"answer={row.answer}" if row.passed else f"{row.status}: {row.detail}"
+            if row.variants is not None:
+                run = row.variants
+                ceiling = run.ceilings.get(row.family or "")
+                detail = (
+                    f"{run.emitted}/{run.requested} variants ({run.draws} draws, "
+                    f"{run.invalid} rejected, {run.duplicates} duplicates, ceiling "
+                    f"{'unknown' if ceiling is None else ceiling})"
+                )
+                if not row.passed:
+                    detail += f": {row.detail}"
+            elif row.passed:
+                detail = f"answer={row.answer}"
+            else:
+                detail = f"{row.status}: {row.detail}"
             lines.append(f"    {mark}  {where}  {detail}")
+            if row.variants is not None:
+                for reason, count in row.variants.rejection_reasons.most_common():
+                    lines.append(f"            {count:6d} rejected: {reason}")
+                for warning, count in row.variants.readability_warnings.most_common():
+                    lines.append(f"            {count:6d} emitted with readability warning: {warning}")
             for warning in row.warnings:
                 lines.append(f"            readability warning (not blocking): {warning}")
         return "\n".join(lines)
@@ -378,56 +409,104 @@ def generate(
             f"{family_name} has {limit} unique valid combinations; n={n} requested "
             f"-- will emit at most {limit} and then stop"
         )
-    streak = 0  # consecutive draws that emitted nothing; only consulted when limit is None
 
     with ManifestWriter(out_dir, overwrite=overwrite) as writer:
-        while stats.emitted < n and stats.draws < ceiling:
-            if limit is not None and stats.emitted >= limit:
-                stats.stopped_early = (
-                    f"{family_name} has emitted all {limit} of its unique valid "
-                    f"combinations; stopping at {stats.emitted}/{n} emitted"
-                )
-                break
-            if limit is None and streak >= DUPLICATE_STREAK_LIMIT:
-                stats.stopped_early = (
-                    f"no new unique problems found after {streak} consecutive duplicate "
-                    f"or rejected draws; stopping early at {stats.emitted}/{n} emitted"
-                )
-                break
+        _draw_into(
+            family,
+            rng,
+            n=n,
+            limit=limit,
+            max_draws=ceiling,
+            out_dir=out_dir,
+            writer=writer,
+            dedupe=dedupe,
+            stats=stats,
+            next_problem_id=lambda: problem_id_for(family_name, stats.emitted),
+            seed=seed,
+            progress_every=progress_every,
+        )
 
-            stats.draws += 1
-            params = family.sample(rng)
-
-            reason = registry.rejection_reason(family.is_valid(params))
-            if reason is not None:
-                stats.invalid += 1
-                stats.rejection_reasons[_reason_key(reason)] += 1
-                streak += 1
-                continue
-
-            record = _emit_problem(
-                family,
-                params,
-                out_dir=out_dir,
-                writer=writer,
-                dedupe=dedupe,
-                stats=stats,
-                next_problem_id=lambda: problem_id_for(family_name, stats.emitted),
-                seed=seed,
-            )
-            if record is None:
-                streak += 1
-                continue
-            streak = 0
-
-            if progress_every and stats.emitted % progress_every == 0:
-                print(
-                    f"  {stats.emitted}/{n} emitted ({stats.draws} draws)",
-                    file=sys.stderr,
-                    flush=True,
-                )
-
+    
     return stats
+
+
+def _draw_into(
+    family: Any,
+    rng: np.random.Generator,
+    *,
+    n: int,
+    limit: Optional[int],
+    max_draws: int,
+    out_dir: Path,
+    writer: ManifestWriter,
+    dedupe: Deduplicator,
+    stats: RunStats,
+    next_problem_id: Callable[[], str],
+    seed: int,
+    pinned: Optional[Mapping[str, Any]] = None,
+    readability: str = "block",
+    origin: str = "generated",
+    record_fields: Optional[Mapping[str, Any]] = None,
+    progress_every: int = 0,
+) -> None:
+    """Draw from one family until ``n`` are emitted into ``stats``, or it stops early.
+
+    The loop of ``generate``, shared with seeded rows of ``generate_from_file``. With
+    ``pinned`` unset the draw is ``family.sample(rng)`` and the check ``is_valid``,
+    exactly as for a plain run; with it, the pins are passed to ``sample`` and
+    ``readability`` picks the check (``registry.draw_verdict``).
+    """
+    name = family.NAME
+    streak = 0  # consecutive draws that emitted nothing; only consulted when limit is None
+    while stats.emitted < n and stats.draws < max_draws:
+        if limit is not None and stats.emitted >= limit:
+            stats.stopped_early = (
+                f"{name} has emitted all {limit} of its unique valid "
+                f"combinations; stopping at {stats.emitted}/{n} emitted"
+            )
+            break
+        if limit is None and streak >= DUPLICATE_STREAK_LIMIT:
+            stats.stopped_early = (
+                f"no new unique problems found after {streak} consecutive duplicate "
+                f"or rejected draws; stopping early at {stats.emitted}/{n} emitted"
+            )
+            break
+
+        stats.draws += 1
+        params = family.sample(rng) if pinned is None else family.sample(rng, pinned)
+
+        reason, warnings = registry.draw_verdict(family, params, readability)
+        if reason is not None:
+            stats.invalid += 1
+            stats.rejection_reasons[_reason_key(reason)] += 1
+            streak += 1
+            continue
+
+        record = _emit_problem(
+            family,
+            params,
+            out_dir=out_dir,
+            writer=writer,
+            dedupe=dedupe,
+            stats=stats,
+            next_problem_id=next_problem_id,
+            seed=seed,
+            origin=origin,
+            record_fields=record_fields,
+        )
+        if record is None:
+            streak += 1
+            continue
+        streak = 0
+        for warning in warnings:
+            stats.readability_warnings[_reason_key(warning)] += 1
+
+        if progress_every and stats.emitted % progress_every == 0:
+            print(
+                f"  {stats.emitted}/{n} emitted ({stats.draws} draws)",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def _warn(message: str) -> None:
@@ -553,17 +632,24 @@ def generate_from_file(
     path: Path | str,
     out_dir: Path | str,
     *,
+    seed: int = 0,
     precision: int = DEFAULT_PRECISION,
     overwrite: bool = False,
     progress_every: int = 0,
 ) -> RunStats:
-    """Emit one problem per row of a structured-input file, in file order.
+    """Emit one problem per ordinary row of a structured-input file, and ``variants``
+    problems per seeded row, in file order.
 
     Each row replaces a random draw. Unlike a draw, a row is only blocked by
     geometry issues: readability issues are recorded as warnings, since those
     checks exist to filter noisy draws and a real problem is not noise. A row is
     emitted only if the family's answer matches its ``expected_answer`` to within
     ``verify.TOLERANCE``.
+
+    A seeded row runs ``generate``'s draw loop (``_draw_into``) with its params
+    pinned, on a stream derived from ``seed`` and its ``input_id``, so its variants
+    are validated, deduplicated and verified exactly as random draws are, and do not
+    change when other rows are added, removed or reordered.
 
     Row-level failures are recorded in ``stats.rows`` and the run continues.
     ``VerificationError`` and ``EmitError`` still abort, as in ``generate``: the
@@ -572,14 +658,32 @@ def generate_from_file(
     """
     rows = load_rows(path)
     dedupe = Deduplicator(precision=precision)
+    requested = sum(
+        row.variants if isinstance(row, StructuredProblem) and row.seeded else 1 for row in rows
+    )
     stats = RunStats(
-        family=f"from-file {Path(path).name}", seed=None, requested=len(rows), structured=True
+        family=f"from-file {Path(path).name}",
+        seed=seed if any(isinstance(row, StructuredProblem) and row.seeded for row in rows) else None,
+        requested=requested,
+        structured=True,
     )
     out_dir = Path(out_dir)
 
     with ManifestWriter(out_dir, overwrite=overwrite) as writer:
         for row in rows:
             stats.draws += 1
+            if isinstance(row, StructuredProblem) and row.seeded:
+                outcome = _seeded_row(
+                    row,
+                    seed=seed,
+                    precision=precision,
+                    out_dir=out_dir,
+                    writer=writer,
+                    dedupe=dedupe,
+                    stats=stats,
+                )
+                stats.rows.append(outcome)
+                continue
             outcome = _structured_row(row, out_dir=out_dir, writer=writer, dedupe=dedupe, stats=stats)
             stats.rows.append(outcome)
             if outcome.status in ("input_error", "geometry_rejected"):
@@ -596,6 +700,95 @@ def generate_from_file(
                 )
 
     return stats
+
+
+def _row_stream(input_id: str) -> int:
+    """A seeded row's stream key: stable across runs and Python versions, and distinct
+    for ids that share a prefix (which ``generate_mixed``'s 8-byte name key is not)."""
+    return int.from_bytes(hashlib.sha256(input_id.encode("utf-8")).digest()[:8], "little")
+
+
+def _seeded_row(
+    row: StructuredProblem,
+    *,
+    seed: int,
+    precision: int,
+    out_dir: Path,
+    writer: ManifestWriter,
+    dedupe: Deduplicator,
+    stats: RunStats,
+) -> RowOutcome:
+    """Draw a seeded row's variants into the run and say what happened.
+
+    The row's own draw counts live on a ``RunStats`` of its own, so a row asking for
+    twenty variants does not read as twenty rows; what it emitted is added to the
+    run's totals. Dedupe is shared with the rest of the file, so a variant never
+    repeats another row's problem.
+    """
+    family = registry.get(row.family)
+    assert row.variants is not None
+    run = RunStats(family=row.input_id, seed=seed, requested=row.variants)
+    valid = registry.valid_signatures(
+        family, precision=precision, pinned=row.params, readability=row.readability
+    )
+    # What this row can still emit: its pinned space, less what earlier rows took.
+    limit = None if valid is None else len(valid - dedupe.signatures)
+    run.ceilings[row.family] = limit
+    if limit is not None and row.variants > limit:
+        _warn(
+            f"{row.input_id}: {limit} unique valid variants with these pins; "
+            f"{row.variants} requested -- will emit at most {limit}"
+        )
+    ids = row.variant_ids()
+
+    outcome = RowOutcome(row.line, row.input_id, row.family, "emitted", variants=run)
+    try:
+        _draw_into(
+            family,
+            np.random.default_rng([seed, _row_stream(row.input_id)]),
+            n=row.variants,
+            limit=limit,
+            max_draws=row.variants * DEFAULT_DRAW_MULTIPLIER,
+            out_dir=out_dir,
+            writer=writer,
+            dedupe=dedupe,
+            stats=run,
+            next_problem_id=lambda: ids[run.emitted],
+            seed=seed,
+            pinned=row.params,
+            readability=row.readability,
+            origin="seeded",
+            record_fields={"parent_input_id": row.input_id, "pinned": row.params, **row.provenance()},
+        )
+    except (VerificationError, EmitError):
+        raise
+    except Exception as exc:  # a row-level bug (schema, solve) is reported, not fatal
+        outcome.status, outcome.detail = "error", f"{type(exc).__name__}: {exc}"
+
+    stats.emitted += run.emitted
+    stats.per_family.update(run.per_family)
+    stats.worst_relative_difference = max(
+        stats.worst_relative_difference, run.worst_relative_difference
+    )
+    for warning, count in run.readability_warnings.items():
+        stats.readability_warnings[warning] += count
+
+    if outcome.status == "emitted" and not run.complete:
+        outcome.status = "short"
+        if limit is not None and run.emitted >= limit:
+            assert valid is not None
+            taken = len(valid) - limit
+            outcome.detail = (
+                f"only {len(valid)} unique valid variants with these pins"
+                + (f", {taken} already emitted by earlier rows" if taken else "")
+            )
+            if not valid and row.readability == "block":
+                outcome.detail += ' (try "readability": "warn")'
+        else:
+            outcome.detail = run.stopped_early or (
+                f"stopped after {run.draws} draws with {run.emitted}/{run.requested} emitted"
+            )
+    return outcome
 
 
 def _structured_row(
@@ -713,7 +906,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PROBLEMS.jsonl",
         help="emit one problem per row of a structured-input JSONL file instead of "
-        "drawing at random; excludes --family, --n, --seed and --max-draws",
+        "drawing at random, or --seed-driven variants for rows with 'variants'; "
+        "excludes --family, --n and --max-draws",
     )
     return parser
 
@@ -780,8 +974,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
-#: Options that only make sense for random draws.
-_DRAW_ONLY_OPTIONS = {"family": "--family", "n": "--n", "seed": "--seed", "max_draws": "--max-draws"}
+#: Options that only make sense for random draws. ``--seed`` is shared: it seeds the
+#: variants of a structured file's seeded rows.
+_DRAW_ONLY_OPTIONS = {"family": "--family", "n": "--n", "max_draws": "--max-draws"}
 
 
 def _explicit_options(argv: Optional[Sequence[str]]) -> set[str]:
@@ -811,6 +1006,7 @@ def _main_from_file(
         stats = generate_from_file(
             args.from_file,
             args.out,
+            seed=args.seed,
             precision=args.precision,
             overwrite=args.overwrite,
             progress_every=args.progress_every,
@@ -824,13 +1020,14 @@ def _main_from_file(
 
     if not stats.complete:
         failed = [row for row in stats.rows if not row.passed]
-        print(f"{len(failed)} of {stats.requested} rows were not emitted:", file=sys.stderr)
+        print(f"{len(failed)} of {len(stats.rows)} rows did not complete:", file=sys.stderr)
         for row in failed:
             print(
                 f"  line {row.line} {row.input_id or '<no input_id>'}: {row.status}: {row.detail}",
                 file=sys.stderr,
             )
-        return 1
+        # Only seeded rows falling short, as a plain run does at its ceiling: exit 2.
+        return 2 if all(row.status == "short" for row in failed) else 1
     return 0
 
 

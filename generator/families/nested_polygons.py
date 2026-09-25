@@ -58,7 +58,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator
 from fractions import Fraction
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from numpy.random import Generator as RNG
@@ -186,31 +186,50 @@ def exact_area(k: int, side: int | Fraction) -> Expr:
 # --- family contract ------------------------------------------------------
 
 
-def sample(rng: RNG) -> Params:
+def _inner_count_stop(n: int) -> int:
+    """Exclusive upper bound for a drawn ``m``: fewer sides than ``n``.
+
+    A pinned ``n`` of 3 leaves no smaller count, so ``m`` is then drawn as 3 and
+    left to ``is_valid``'s inner-fewer-sides rule rather than to an empty range.
+    """
+    return max(n, MIN_SIDES + 1)
+
+
+def sample(rng: RNG, pinned: Optional[Params] = None) -> Params:
     """Draw side counts and integer side lengths, unfiltered.
 
     Draws freely and lets ``is_valid`` reject, rather than sampling from the
     constrained space directly. That is the right tradeoff only while the
     acceptance rate stays high; if it drops, the fix is a smarter draw here, not a
     looser predicate there.
+
+    A key in ``pinned`` is taken as given and not drawn, and ``m`` is drawn against
+    the ``n`` actually used. An empty ``pinned`` consumes ``rng`` exactly as a plain
+    draw does.
     """
-    n = int(rng.integers(MIN_SIDES + 1, MAX_SIDES + 1))
-    m = int(rng.integers(MIN_SIDES, n))
-    return {
-        "n": n,
-        "m": m,
-        "side_outer": int(rng.integers(MIN_SIDE_LENGTH, MAX_SIDE_LENGTH + 1)),
-        "side_inner": int(rng.integers(MIN_SIDE_LENGTH, MAX_SIDE_LENGTH + 1)),
-    }
+    pinned = pinned or {}
+    n = pinned["n"] if "n" in pinned else int(rng.integers(MIN_SIDES + 1, MAX_SIDES + 1))
+    m = pinned["m"] if "m" in pinned else int(rng.integers(MIN_SIDES, _inner_count_stop(n)))
+    lengths = {}
+    for key in ("side_outer", "side_inner"):
+        lengths[key] = (
+            pinned[key]
+            if key in pinned
+            else int(rng.integers(MIN_SIDE_LENGTH, MAX_SIDE_LENGTH + 1))
+        )
+    return {"n": n, "m": m, **lengths}
 
 
-def parameter_space() -> Iterator[Params]:
-    """Every parameter set ``sample`` can draw, unfiltered; ``registry.ceiling`` counts
-    the valid ones so a run can be told when it asks for more than the family has."""
-    for n in range(MIN_SIDES + 1, MAX_SIDES + 1):
-        for m in range(MIN_SIDES, n):
-            for side_outer in range(MIN_SIDE_LENGTH, MAX_SIDE_LENGTH + 1):
-                for side_inner in range(MIN_SIDE_LENGTH, MAX_SIDE_LENGTH + 1):
+def parameter_space(pinned: Optional[Params] = None) -> Iterator[Params]:
+    """Every parameter set ``sample`` can draw with ``pinned``, unfiltered;
+    ``registry.ceiling`` counts the valid ones so a run can be told when it asks for
+    more than the family has."""
+    pinned = pinned or {}
+    lengths = range(MIN_SIDE_LENGTH, MAX_SIDE_LENGTH + 1)
+    for n in [pinned["n"]] if "n" in pinned else range(MIN_SIDES + 1, MAX_SIDES + 1):
+        for m in [pinned["m"]] if "m" in pinned else range(MIN_SIDES, _inner_count_stop(n)):
+            for side_outer in [pinned["side_outer"]] if "side_outer" in pinned else lengths:
+                for side_inner in [pinned["side_inner"]] if "side_inner" in pinned else lengths:
                     yield {"n": n, "m": m, "side_outer": side_outer, "side_inner": side_inner}
 
 

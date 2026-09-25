@@ -1,0 +1,5 @@
+{"input_id": "circle_in_hexagon_10", "family": "inscribed_circle", "params": {"k": 6, "side": 10}, "expected_answer": "150*sqrt(3) - 75*pi", "notes": "The source problem, checked against its known answer; hex_ring below varies it."}
+{"input_id": "hex_ring", "family": "inscribed_circle", "params": {"k": 6}, "variants": 10, "notes": "Hexagon kept, side drawn."}
+{"input_id": "square_in_hexagon", "family": "nested_polygons", "params": {"n": 6, "m": 4}, "variants": 10, "notes": "Shapes kept, both side lengths drawn."}
+{"input_id": "hexagon_in_square", "family": "nested_polygons", "params": {"n": 4, "m": 6}, "variants": 5, "readability": "warn", "notes": "More inner sides than outer: no random draw produces this, so readability only warns."}
+{"input_id": "l_width_12_5", "family": "composite_rectilinear", "params": {"width": 12.5}, "variants": 5, "notes": "A non-integer pinned width; the notch is drawn below it."}

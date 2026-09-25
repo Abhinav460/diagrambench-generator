@@ -76,7 +76,7 @@ records = list(read_manifest("runs/dev", strict=False))  # tolerate a killed run
 | `--max-draws` | `200 × --n` | Draw ceiling before giving up. |
 | `--progress-every` | `0` | Print progress to stderr every N problems. `0` disables. |
 | `--list-families` | — | List registered families and exit. |
-| `--from-file` | — | Emit one problem per row of a structured-input JSONL file instead of drawing. Cannot be combined with `--family`, `--n`, `--seed` or `--max-draws`. See "Structured problem input" below. |
+| `--from-file` | — | Emit one problem per row of a structured-input JSONL file instead of drawing, or `variants` problems per seeded row. `--seed` seeds those variants. Cannot be combined with `--family`, `--n` or `--max-draws`. See "Structured problem input" below. |
 
 Exit codes: `0` reached `--n`; `1` a real failure (verification disagreement, or an
 unwritable output directory); `2` ran out of draws short of `--n`. A short run is
@@ -181,6 +181,46 @@ or FAIL with its reason. `expected_answer` is restricted to numbers, arithmetic
 operators and a short list of names (`sqrt`, `cbrt`, `pi`, `E`, `Rational`, ...)
 before sympy parses it, so an input file cannot run code.
 
+### Seeded rows: variants of a partly specified problem
+
+Add `variants` to a row to get that many new problems *like* it, instead of the one
+it names. Its `params` may name any subset of the family's keys, including none:
+those are pinned, and the rest are drawn by the family's own `sample` conditioned
+on them.
+
+```json
+{"input_id": "hex_ring", "family": "inscribed_circle", "params": {"k": 6}, "variants": 20}
+{"input_id": "square_in_hexagon", "family": "nested_polygons", "params": {"n": 6, "m": 4}, "variants": 20}
+{"input_id": "hexagon_in_square", "family": "nested_polygons", "params": {"n": 4, "m": 6}, "variants": 5, "readability": "warn"}
+```
+
+```bash
+.venv/bin/python -m generator.cli --from-file examples/seeded_problems.jsonl \
+    --seed 0 --out runs/seeded --report
+```
+
+- Variants go through `generate`'s own loop: validated, deduplicated, solved,
+  verified and rendered exactly as random draws are. They are emitted as
+  `<input_id>_000`, `<input_id>_001`, ... with `origin: "seeded"`, the run's
+  `seed`, `parent_input_id`, and the `pinned` params.
+- `expected_answer` is not allowed on a seeded row, since each variant has its
+  own answer. To check that the family models the source problem, put the source
+  in the same file as an ordinary row.
+- Readability checks **block** variants, as they do random draws. A row may set
+  `"readability": "warn"` to block only geometry, for pins a random draw would never
+  produce (a hexagon inside a square is otherwise rejected on every draw).
+- Each seeded row draws from its own stream, derived from `--seed` and its
+  `input_id`, so adding, removing or reordering other rows does not change its
+  variants. (Rows share dedupe: a variant never repeats another row's problem.)
+- A row's ceiling is the number of distinct valid parameter sets under its pins,
+  less any that earlier rows already emitted. Asking for more warns up front, and
+  the row stops there and is reported `SHORT`. A run whose only shortfall is short
+  seeded rows exits `2`; any other failed row makes it `1`.
+- Supported for `inscribed_circle`, `nested_polygons` and `composite_rectilinear`.
+  `coordinate_polygon` is a follow-up: its single `points` param cannot express
+  "same vertex count" or "keep this vertex", so it needs a pinning design of its
+  own rather than the per-key scheme.
+
 ## How it fits together
 
 ```
@@ -242,7 +282,11 @@ Drop a module in `generator/families/`. It is auto-discovered, and must define
 
 - `sample(rng) -> params` — draw from the parameter space using the passed
   `Generator` only. Constructing its own randomness breaks reproducibility, and a
-  test enforces that.
+  test enforces that. To support seeded rows, take an optional `pinned` mapping:
+  use a pinned value instead of drawing it, draw dependent params against the
+  value actually used, and leave the draws unchanged when `pinned` is empty.
+  `parameter_space(pinned)` must then yield exactly what `sample` can draw with
+  those pins.
 - `is_valid(params) -> True | str` — return `True`, or a **reason string**. The
   string is what makes a low acceptance rate diagnosable instead of guesswork.
 - `solve(params) -> (stem, answer_exact, geometry_spec)` — exact sympy answer, and
