@@ -33,6 +33,7 @@ JSONL, one problem per line; blank lines are skipped::
 ``expected_answer`` is checked token by token before sympy sees it: only numbers,
 the operators ``+ - * / ^ ** ( ) ,`` and the names in ``ANSWER_NAMES`` are allowed,
 and the parse then runs with no builtins in scope. An input file cannot run code.
+The parser lives in ``generator.answers``; it is re-exported here.
 
 Each row is checked independently, so one bad row is reported rather than
 aborting the file.
@@ -40,23 +41,15 @@ aborting the file.
 
 from __future__ import annotations
 
-import io
 import json
-import keyword
-import math
 import re
-import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import Any, Optional, Union
 
 from generator import registry
+from generator.answers import ANSWER_NAMES, parse_expected_answer
 from generator.params import parse_params
-
-if TYPE_CHECKING:
-    from sympy import Expr
-else:
-    Expr = Any
 
 __all__ = [
     "ANSWER_NAMES",
@@ -80,13 +73,6 @@ SOURCE_FIELDS = {
 }
 
 _INPUT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-
-#: The only names an ``expected_answer`` may use; any other name is an unknown symbol.
-ANSWER_NAMES = ("sqrt", "cbrt", "pi", "E", "Rational", "Abs", "sin", "cos", "tan")
-_ANSWER_OPS = frozenset({"+", "-", "*", "/", "**", "^", "(", ")", ","})
-_LAYOUT_TOKENS = frozenset(
-    {tokenize.NEWLINE, tokenize.NL, tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER}
-)
 
 
 class StructuredInputError(ValueError):
@@ -118,81 +104,6 @@ class RowError:
     input_id: Optional[str]
     family: Optional[str]
     reason: str
-
-
-def _check_answer_tokens(text: str) -> None:
-    """Allow only numbers, arithmetic operators and ``ANSWER_NAMES``, or raise ``ValueError``.
-
-    sympy's parser evaluates its input as Python, so this runs first: attribute
-    access, subscripts, strings, keywords and unknown names never reach ``eval``.
-    """
-    try:
-        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
-    except (tokenize.TokenError, SyntaxError) as exc:
-        raise ValueError(f"expected_answer {text!r} does not parse: {type(exc).__name__}: {exc}") from None
-
-    unknown: set[str] = set()
-    for token in tokens:
-        if token.type == tokenize.NAME:
-            if keyword.iskeyword(token.string):
-                raise ValueError(f"expected_answer {text!r} does not parse: keyword {token.string!r} is not allowed")
-            if token.string not in ANSWER_NAMES:
-                unknown.add(token.string)
-        elif token.type == tokenize.OP:
-            if token.string not in _ANSWER_OPS:
-                raise ValueError(f"expected_answer {text!r} does not parse: operator {token.string!r} is not allowed")
-        elif token.type != tokenize.NUMBER and token.type not in _LAYOUT_TOKENS:
-            raise ValueError(
-                f"expected_answer {text!r} does not parse: "
-                f"{tokenize.tok_name[token.type]} {token.string!r} is not allowed"
-            )
-    if unknown:
-        raise ValueError(f"expected_answer {text!r} contains unknown symbols {sorted(unknown)}")
-
-
-def _answer_namespace() -> dict[str, Any]:
-    """Everything ``eval`` can see while parsing an answer.
-
-    ``ANSWER_NAMES`` plus the constructors sympy's own tokenizer emits
-    (``Integer('7')``, ``Float('.5')``, ``I`` for a ``j`` literal) and no builtins.
-    """
-    import sympy as sp
-
-    namespace: dict[str, Any] = {name: getattr(sp, name) for name in ANSWER_NAMES}
-    namespace.update(Integer=sp.Integer, Float=sp.Float, I=sp.I, __builtins__={})
-    return namespace
-
-
-def parse_expected_answer(text: str) -> Expr:
-    """Parse an answer string into a constant sympy expression, or raise ``ValueError``."""
-    from sympy.parsing.sympy_parser import (
-        convert_xor,
-        parse_expr,
-        standard_transformations,
-    )
-
-    _check_answer_tokens(text)
-    try:
-        expr = parse_expr(
-            text,
-            local_dict={},
-            global_dict=_answer_namespace(),
-            transformations=standard_transformations + (convert_xor,),
-        )
-    except Exception as exc:  # parse_expr raises SyntaxError, TypeError, TokenError, ...
-        raise ValueError(f"expected_answer {text!r} does not parse: {type(exc).__name__}: {exc}") from None
-    if getattr(expr, "free_symbols", None):
-        raise ValueError(
-            f"expected_answer {text!r} contains unknown symbols "
-            f"{sorted(str(s) for s in expr.free_symbols)}"
-        )
-    try:
-        value = complex(expr.evalf())
-    except (TypeError, ValueError, AttributeError):
-        raise ValueError(f"expected_answer {text!r} is not a number") from None
-    if value.imag != 0 or not math.isfinite(value.real):
-        raise ValueError(f"expected_answer {text!r} is not a finite real number")
-    return expr
 
 
 def _check_row(data: Any, seen_ids: set[str]) -> Union[tuple[str, str, dict, str, dict, Optional[str]], str]:

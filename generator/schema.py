@@ -1,4 +1,4 @@
-"""The canonical record for a DiagramBench problem, generated or harvested.
+"""The canonical record for a DiagramBench problem: generated, harvested, or given.
 
 This module exists so that every downstream module -- ``render``, ``verify``,
 ``dedupe``, ``emit``, and later the separate harvest package -- agrees on one
@@ -49,31 +49,49 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import MISSING, dataclass, fields
 from typing import Any, Literal, Optional, Union
 
 __all__ = [
+    "ANSWER_TYPES",
+    "AnswerType",
     "Category",
     "Datapoint",
     "ORIGINS",
+    "PAPER_PROBLEM_COUNT",
     "SchemaValidationError",
+    "StemLeakWarning",
     "Origin",
     "canonical_params",
     "stem_leaks_geometry",
 ]
 
-Origin = Literal["generated", "harvested", "structured"]
+Origin = Literal["generated", "harvested", "structured", "given"]
 
 #: Every accepted ``origin``. ``structured`` is a real problem entered by hand as a
 #: family's params: it has params and a signature like a generated record, no seed
 #: because nothing was drawn, and a known answer to check the family against.
-ORIGINS = ("generated", "harvested", "structured")
+#: ``given`` is one of the paper's own problems, packaged as it was published:
+#: nothing was drawn or solved, so it has no seed, params, signature or generator
+#: version, and it is identified by its ``paper_index``.
+ORIGINS = ("generated", "harvested", "structured", "given")
+
+#: How many problems the paper gives; a ``given`` record's ``paper_index`` is 1..this.
+PAPER_PROBLEM_COUNT = 200
+
+#: What a record's answer fields hold. ``exact``: ``answer_exact`` and
+#: ``answer_decimal`` are set. ``unavailable``: the source publishes no answer, so
+#: both are None -- which is not the same as a proof problem, whose answer is an
+#: argument rather than a number; that would need its own value.
+AnswerType = Literal["exact", "unavailable"]
+ANSWER_TYPES = ("exact", "unavailable")
 
 #: Fields added after the manifest format was fixed, omitted from ``to_dict`` while
 #: unset so that records of the existing origins serialize byte-identically to the
 #: manifests already on disk.
-_OMIT_WHEN_NONE = frozenset({"expected_answer"})
+_OMIT_WHEN_NONE = frozenset({"expected_answer", "answer_type", "paper_index", "source_image"})
 
 #: 1 = diagram-dependent, 2 = textual. The paper's two-category structure, and the
 #: variable its central claim is measured against, so it belongs in the record
@@ -91,6 +109,16 @@ class SchemaValidationError(ValueError):
 
     Distinct from a bare ValueError so that a generation driver can catch schema
     problems specifically without also swallowing arithmetic errors from sympy.
+    """
+
+
+class StemLeakWarning(UserWarning):
+    """A ``given`` Category 1 stem states geometry that the diagram should carry.
+
+    For generated records the same finding is an error, since the stem was written
+    here and can be reworded. A given stem is the paper's own text: rejecting it
+    would drop a real problem from the dataset, so it is reported instead and left
+    for a person to judge.
     """
 
 
@@ -223,8 +251,10 @@ class Datapoint:
     category: Category
     stem: str
     image_path: Optional[str]
-    answer_exact: str
-    answer_decimal: float
+    # Required for every origin except "given" with answer_type="unavailable", where
+    # both are None: the source publishes no answer to record.
+    answer_exact: Optional[str]
+    answer_decimal: Optional[float]
     origin: Origin
 
     # Procedural-generation provenance. Required for origin="generated", required
@@ -252,6 +282,14 @@ class Datapoint:
     # answer the source gives, as a sympy-parseable string, which the driver checked
     # ``answer_exact`` against before emitting. Optional and unset for the others.
     expected_answer: Optional[str] = None
+
+    # Given-problem provenance. ``paper_index`` (1..PAPER_PROBLEM_COUNT) and
+    # ``answer_type`` are required for origin="given"; ``source_image`` (the original
+    # image's filename or hash, for tracing a record back to what the paper shipped)
+    # is optional. Unset and unserialized for the other origins.
+    paper_index: Optional[int] = None
+    source_image: Optional[str] = None
+    answer_type: Optional[AnswerType] = None
 
     def __post_init__(self) -> None:
         # Canonicalize on the way in so callers may pass a dict while storage
@@ -295,13 +333,32 @@ class Datapoint:
 
         self._validate_category_coupling()
 
-        for name in ("problem_id", "family", "stem", "answer_exact"):
+        for name in ("problem_id", "family", "stem"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise SchemaValidationError(f"{name} must be a non-empty string; got {value!r}")
 
         self._validate_origin_coupling()
 
+        if self.origin == "given" and self.answer_type == "unavailable":
+            for name in ("answer_exact", "answer_decimal"):
+                if getattr(self, name) is not None:
+                    raise SchemaValidationError(
+                        f"answer_type='unavailable' means there is no answer; got "
+                        f"{name}={getattr(self, name)!r}"
+                    )
+        else:
+            self._validate_answer()
+
+        if self.params is not None:
+            self._validate_params()
+
+    def _validate_answer(self) -> None:
+        """Require a non-empty exact answer and a finite, non-zero decimal one."""
+        if not isinstance(self.answer_exact, str) or not self.answer_exact.strip():
+            raise SchemaValidationError(
+                f"answer_exact must be a non-empty string; got {self.answer_exact!r}"
+            )
         if isinstance(self.answer_decimal, bool) or not isinstance(
             self.answer_decimal, (int, float)
         ):
@@ -316,9 +373,6 @@ class Datapoint:
             raise SchemaValidationError(
                 "answer_decimal is zero, which means the configuration is degenerate"
             )
-
-        if self.params is not None:
-            self._validate_params()
 
     def _validate_origin_coupling(self) -> None:
         """Tie the generator-only fields to ``origin``.
@@ -367,6 +421,35 @@ class Datapoint:
                     f"origin='structured' was not drawn from a seed; got seed={self.seed!r}"
                 )
             self._validate_structured_param_keys()
+
+        elif self.origin == "given":
+            # Nothing was drawn or solved: a seed or signature here would claim a
+            # reproduction path that does not exist.
+            present = [name for name in generator_only if getattr(self, name) is not None]
+            if present:
+                raise SchemaValidationError(
+                    f"origin='given' has no generator provenance; {present} must be None"
+                )
+            if (
+                isinstance(self.paper_index, bool)
+                or not isinstance(self.paper_index, int)
+                or not 1 <= self.paper_index <= PAPER_PROBLEM_COUNT
+            ):
+                raise SchemaValidationError(
+                    f"origin='given' requires paper_index, an int in 1..{PAPER_PROBLEM_COUNT}; "
+                    f"got {self.paper_index!r}"
+                )
+            if self.answer_type not in ANSWER_TYPES:
+                raise SchemaValidationError(
+                    f"origin='given' requires answer_type, one of {ANSWER_TYPES}; "
+                    f"got {self.answer_type!r}"
+                )
+            if self.source_image is not None and (
+                not isinstance(self.source_image, str) or not self.source_image.strip()
+            ):
+                raise SchemaValidationError(
+                    f"source_image must be a non-empty string when set; got {self.source_image!r}"
+                )
 
     def _validate_structured_param_keys(self) -> None:
         """Require exactly the keys the family's ``solve`` reads.
@@ -421,6 +504,9 @@ class Datapoint:
         Category 2 problem with one has quietly become Category 1 -- which would
         corrupt the comparison the paper's central claim is measured against, since
         the between-category gap is the result.
+
+        A leaking stem on a ``given`` record warns (``StemLeakWarning``) rather than
+        rejects: it is the paper's text, not ours to reword.
         """
         if self.category == 1:
             if not isinstance(self.image_path, str) or not self.image_path.strip():
@@ -430,10 +516,14 @@ class Datapoint:
                 )
             leak = stem_leaks_geometry(self.stem)
             if leak is not None:
-                raise SchemaValidationError(
+                message = (
                     f"category 1 stem must not carry geometric information: {leak}. "
                     f"stem was {self.stem!r}"
                 )
+                if self.origin == "given":
+                    warnings.warn(f"{self.problem_id}: {message}", StemLeakWarning, stacklevel=3)
+                else:
+                    raise SchemaValidationError(message)
         elif self.image_path is not None:
             raise SchemaValidationError(
                 "category 2 is textual and must not carry a diagram; "
@@ -447,7 +537,9 @@ class Datapoint:
             value = getattr(self, f.name)
             if value is None and f.name in _OMIT_WHEN_NONE:
                 continue
-            out[f.name] = self.params_dict if f.name == "params" else value
+            # A record with no params (harvested, given) writes null, not {}: an empty
+            # object reads back as params=(), which is not the record that was written.
+            out[f.name] = self.params_dict if f.name == "params" and value is not None else value
         return out
 
     def to_json(self) -> str:
