@@ -4,6 +4,7 @@ the ceiling is warned, stopped, and reported rather than left burning draws."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -73,14 +74,20 @@ def test_run_at_the_ceiling_completes_without_warning(tmp_path, capsys, no_rende
     assert capsys.readouterr().err == ""
 
 
+#: Seed and params of the n=10 runs in output/final, written 2026-09-10, before
+#: ceilings existed (9b834c5). Only what the test compares is kept: output/ is
+#: gitignored, so reading the manifests directly only ever passed on one machine.
+GOLDEN = json.loads((REPO / "tests" / "data" / "ceiling_golden_params.json").read_text())
+
+
 @pytest.mark.parametrize("name", sorted(registry.available()))
 def test_run_under_the_ceiling_is_unchanged(name, tmp_path, capsys, no_render):
-    """Same seed, same params as before ceilings existed: the checked-in n=10 runs."""
-    golden = list(read_manifest(REPO / "output" / "final" / name))
-    stats = generate(name, len(golden), golden[0].seed, tmp_path / "run")
+    """Same seed, same params as before ceilings existed: the saved n=10 runs."""
+    golden = GOLDEN[name]
+    stats = generate(name, len(golden["params"]), golden["seed"], tmp_path / "run")
     assert stats.complete and stats.stopped_early is None
     assert capsys.readouterr().err == ""
-    assert [r.params for r in read_manifest(tmp_path / "run")] == [r.params for r in golden]
+    assert [r.params_dict for r in read_manifest(tmp_path / "run")] == golden["params"]
 
 
 # --- an unknown ceiling: the duplicate-streak guard --------------------------
