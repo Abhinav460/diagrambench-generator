@@ -10,12 +10,14 @@ geometric information.
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 
 from generator import GENERATOR_VERSION
 from generator.cli import generate
 from generator.emit import read_manifest
-from generator.schema import Datapoint, SchemaValidationError, stem_leaks_geometry
+from generator.schema import Datapoint, SchemaValidationError, StemLeakWarning, stem_leaks_geometry
 
 
 def make(**overrides) -> Datapoint:
@@ -147,6 +149,62 @@ def test_the_leak_check_does_not_apply_to_category_two():
 def test_the_error_message_names_the_offending_stem():
     with pytest.raises(SchemaValidationError, match="hexagon"):
         make(stem="Find the area of the hexagon.").validate()
+
+
+# --- given records: the paper's own stems warn instead of rejecting ------------
+
+
+def make_given(**overrides) -> Datapoint:
+    base = dict(
+        problem_id="paper_042",
+        family="given",
+        category=1,
+        stem="Find the area of the shaded region.",
+        image_path="images/paper_042.png",
+        answer_exact="3*sqrt(3)/2",
+        answer_decimal=2.598076211353316,
+        origin="given",
+        paper_index=42,
+        answer_type="exact",
+    )
+    base.update(overrides)
+    return Datapoint(**base)
+
+
+@pytest.mark.parametrize(
+    "stem",
+    [
+        "Find the area between the hexagon and the triangle.",
+        "The square has side 4. Find the shaded area.",
+        "Find the area of the two shaded regions.",
+    ],
+)
+def test_a_leaking_given_stem_warns_instead_of_rejecting(stem):
+    with pytest.warns(StemLeakWarning, match="must not carry geometric information"):
+        make_given(stem=stem).validate()
+
+
+def test_the_warning_names_the_record_and_the_stem():
+    with pytest.warns(StemLeakWarning, match=r"paper_042: .*hexagon"):
+        make_given(stem="Find the area of the hexagon.").validate()
+
+
+def test_a_clean_given_stem_does_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        make_given().validate()
+
+
+def test_a_given_category_one_record_still_needs_its_diagram():
+    """Only the stem check softens; a Category 1 problem without a figure is still wrong."""
+    with pytest.raises(SchemaValidationError, match="requires an image_path"):
+        make_given(image_path=None).validate()
+
+
+@pytest.mark.parametrize("origin", ["generated", "harvested"])
+def test_other_origins_still_reject_a_leaking_stem(origin):
+    with pytest.raises(SchemaValidationError, match="must not carry geometric information"):
+        make(origin=origin, stem="Find the area of the hexagon.").validate()
 
 
 # --- what the generator actually emits --------------------------------------
