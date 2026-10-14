@@ -82,9 +82,9 @@ ORIGINS = ("generated", "harvested", "structured", "given")
 PAPER_PROBLEM_COUNT = 200
 
 #: What a record's answer fields hold. ``exact``: ``answer_exact`` and
-#: ``answer_decimal`` are set. ``unavailable``: the source publishes no answer, so
-#: both are None -- which is not the same as a proof problem, whose answer is an
-#: argument rather than a number; that would need its own value.
+#: ``answer_decimal`` are set. ``unavailable``: verified ground truth is not
+#: available in the current source, so both are None. A known proof answer would
+#: need its own representation; model responses are not ground truth.
 AnswerType = Literal["exact", "unavailable"]
 ANSWER_TYPES = ("exact", "unavailable")
 
@@ -93,9 +93,9 @@ ANSWER_TYPES = ("exact", "unavailable")
 #: manifests already on disk.
 _OMIT_WHEN_NONE = frozenset({"expected_answer", "answer_type", "paper_index", "source_image"})
 
-#: 1 = diagram-dependent, 2 = textual. The paper's two-category structure, and the
-#: variable its central claim is measured against, so it belongs in the record
-#: rather than being inferred from whether ``image_path`` happens to be set.
+#: 1 = diagram-dependent, 2 = textual. A given problem may have an unknown
+#: category (None) until the paper's labels are verified. Category belongs in
+#: the record rather than being inferred from whether an image is present.
 Category = Literal[1, 2]
 
 JsonScalar = Union[str, int, float, bool, None]
@@ -248,11 +248,11 @@ class Datapoint:
 
     problem_id: str
     family: str
-    category: Category
-    stem: str
+    category: Optional[Category]  # None only for a given problem with unknown category
+    stem: Optional[str]  # None only when a given problem's source image is the statement
     image_path: Optional[str]
     # Required for every origin except "given" with answer_type="unavailable", where
-    # both are None: the source publishes no answer to record.
+    # both are None because no verified ground truth is recorded yet.
     answer_exact: Optional[str]
     answer_decimal: Optional[float]
     origin: Origin
@@ -312,9 +312,9 @@ class Datapoint:
         """Raise ``SchemaValidationError`` if this record would corrupt later stages.
 
         Checks the invariants that are cheap here and expensive to discover later:
-        a non-finite or zero answer means the solver produced nonsense, an empty
-        stem means the problem has no question, and params that will not survive a
-        JSON round-trip mean the manifest cannot be reloaded.
+        a non-finite answer means the solver produced nonsense, an empty stem on a
+        generated record means it has no question, and params that will not survive
+        a JSON round-trip mean the manifest cannot be reloaded.
         """
         if self.origin not in ORIGINS:
             raise SchemaValidationError(f"origin must be one of {ORIGINS}; got {self.origin!r}")
@@ -322,21 +322,29 @@ class Datapoint:
         # Two traps: bool is a subclass of int, so True would pass as 1; and
         # 1.0 == 1, so a float would pass the membership test and then serialize
         # as "1.0", breaking an exact round-trip.
-        if (
-            isinstance(self.category, bool)
-            or not isinstance(self.category, int)
-            or self.category not in (1, 2)
-        ):
+        if self.category is not None or self.origin != "given":
+            valid_category = (
+                not isinstance(self.category, bool)
+                and isinstance(self.category, int)
+                and self.category in (1, 2)
+            )
+        else:
+            valid_category = True
+        if not valid_category:
             raise SchemaValidationError(
-                f"category must be 1 (diagram-dependent) or 2 (textual); got {self.category!r}"
+                f"category must be 1 (diagram-dependent), 2 (textual), or None "
+                f"for origin='given'; got {self.category!r}"
             )
 
-        self._validate_category_coupling()
-
-        for name in ("problem_id", "family", "stem"):
+        for name in ("problem_id", "family"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise SchemaValidationError(f"{name} must be a non-empty string; got {value!r}")
+        if self.stem is not None or self.origin != "given":
+            if not isinstance(self.stem, str) or not self.stem.strip():
+                raise SchemaValidationError(f"stem must be a non-empty string; got {self.stem!r}")
+
+        self._validate_category_coupling()
 
         self._validate_origin_coupling()
 
@@ -344,7 +352,7 @@ class Datapoint:
             for name in ("answer_exact", "answer_decimal"):
                 if getattr(self, name) is not None:
                     raise SchemaValidationError(
-                        f"answer_type='unavailable' means there is no answer; got "
+                        f"answer_type='unavailable' means no verified answer is recorded; got "
                         f"{name}={getattr(self, name)!r}"
                     )
         else:
@@ -354,7 +362,11 @@ class Datapoint:
             self._validate_params()
 
     def _validate_answer(self) -> None:
-        """Require a non-empty exact answer and a finite, non-zero decimal one."""
+        """Require a non-empty exact answer and a finite decimal one.
+
+        A zero result is degenerate for generated geometry, but may be the valid
+        answer to a problem taken from the paper.
+        """
         if not isinstance(self.answer_exact, str) or not self.answer_exact.strip():
             raise SchemaValidationError(
                 f"answer_exact must be a non-empty string; got {self.answer_exact!r}"
@@ -369,7 +381,7 @@ class Datapoint:
             raise SchemaValidationError(
                 f"answer_decimal must be finite; got {self.answer_decimal!r}"
             )
-        if self.answer_decimal == 0:
+        if self.answer_decimal == 0 and self.origin != "given":
             raise SchemaValidationError(
                 "answer_decimal is zero, which means the configuration is degenerate"
             )
@@ -500,14 +512,37 @@ class Datapoint:
     def _validate_category_coupling(self) -> None:
         """Enforce the invariants that tie a category to the rest of the record.
 
-        A Category 1 problem without a diagram is not a Category 1 problem, and a
-        Category 2 problem with one has quietly become Category 1 -- which would
-        corrupt the comparison the paper's central claim is measured against, since
-        the between-category gap is the result.
+        For generated and harvested records, Category 1 needs a diagram and
+        Category 2 must not have one. A given record may retain its full source
+        image regardless of category, since it contains the published statement.
 
         A leaking stem on a ``given`` record warns (``StemLeakWarning``) rather than
         rejects: it is the paper's text, not ours to reword.
         """
+        if self.origin == "given":
+            # The paper's PNG contains the complete problem statement even when
+            # its category is unknown or no separate stem has been transcribed.
+            # Keep older textual given records valid when they have a stem.
+            if self.image_path is None:
+                if self.category != 2 or self.stem is None:
+                    raise SchemaValidationError(
+                        "origin='given' requires an image_path unless a category 2 stem is present"
+                    )
+            elif not isinstance(self.image_path, str) or not self.image_path.strip():
+                raise SchemaValidationError(
+                    f"image_path must be a non-empty string; got {self.image_path!r}"
+                )
+            if self.category == 1 and self.stem is not None:
+                leak = stem_leaks_geometry(self.stem)
+                if leak is not None:
+                    warnings.warn(
+                        f"{self.problem_id}: category 1 stem must not carry geometric information: "
+                        f"{leak}. stem was {self.stem!r}",
+                        StemLeakWarning,
+                        stacklevel=3,
+                    )
+            return
+
         if self.category == 1:
             if not isinstance(self.image_path, str) or not self.image_path.strip():
                 raise SchemaValidationError(
@@ -520,10 +555,7 @@ class Datapoint:
                     f"category 1 stem must not carry geometric information: {leak}. "
                     f"stem was {self.stem!r}"
                 )
-                if self.origin == "given":
-                    warnings.warn(f"{self.problem_id}: {message}", StemLeakWarning, stacklevel=3)
-                else:
-                    raise SchemaValidationError(message)
+                raise SchemaValidationError(message)
         elif self.image_path is not None:
             raise SchemaValidationError(
                 "category 2 is textual and must not carry a diagram; "
