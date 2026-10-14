@@ -268,12 +268,15 @@ def test_an_unavailable_answer_rejects_a_stray_value(overrides):
     [
         ({"answer_exact": None}, "answer_exact must be a non-empty string"),
         ({"answer_decimal": None}, "answer_decimal must be a real number"),
-        ({"answer_decimal": 0}, "answer_decimal is zero"),
     ],
 )
 def test_an_exact_given_answer_is_checked_like_any_other(overrides, match):
     with pytest.raises(SchemaValidationError, match=match):
         make_given(**overrides).validate()
+
+
+def test_an_exact_given_answer_may_be_zero():
+    make_given(answer_exact="0", answer_decimal=0.0).validate()
 
 
 @pytest.mark.parametrize("origin", ["generated", "harvested"])

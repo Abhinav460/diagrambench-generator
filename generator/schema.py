@@ -354,7 +354,11 @@ class Datapoint:
             self._validate_params()
 
     def _validate_answer(self) -> None:
-        """Require a non-empty exact answer and a finite, non-zero decimal one."""
+        """Require a non-empty exact answer and a finite decimal one.
+
+        A zero result is degenerate for generated geometry, but may be the valid
+        answer to a problem taken from the paper.
+        """
         if not isinstance(self.answer_exact, str) or not self.answer_exact.strip():
             raise SchemaValidationError(
                 f"answer_exact must be a non-empty string; got {self.answer_exact!r}"
@@ -369,7 +373,7 @@ class Datapoint:
             raise SchemaValidationError(
                 f"answer_decimal must be finite; got {self.answer_decimal!r}"
             )
-        if self.answer_decimal == 0:
+        if self.answer_decimal == 0 and self.origin != "given":
             raise SchemaValidationError(
                 "answer_decimal is zero, which means the configuration is degenerate"
             )
