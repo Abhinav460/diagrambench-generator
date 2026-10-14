@@ -1,19 +1,20 @@
 """Package the paper's own problems as origin="given" records.
 
-Input is a JSONL file, one row per paper problem:
+Input is a JSONL file, one row per paper problem. A row can contain only the
+source image and its verified index:
 
-    {"paper_index": 1, "category": 1, "stem": "Find the shaded area.",
-     "answer_exact": "150*sqrt(3) - 75*pi", "answer_type": "exact",
-     "source_image": "image1.png"}
+    {"paper_index": 1, "source_image": "image1.png"}
 
-- ``paper_index`` (required): int, 1..PAPER_PROBLEM_COUNT, unique within the file.
-- ``category`` (required): 1 (diagram-dependent) or 2 (textual).
-- ``stem`` (required): the problem text as published.
-- ``answer_type`` (required): "exact" or "unavailable".
+- ``paper_index`` (required): int, 1..PAPER_PROBLEM_COUNT. Repeated indices
+  among accepted rows are reported and not emitted twice.
+- ``category``: 1 (diagram-dependent), 2 (textual), or null/absent (unknown).
+- ``stem``: optional verified transcription; null/absent means the original image
+  remains the sole problem statement.
+- ``answer_type``: "exact" or "unavailable" (the default).
 - ``answer_exact``: sympy-parseable string; required when answer_type is "exact",
   must be null/absent when "unavailable".
-- ``source_image``: bare .png filename inside ``images_dir``; required for
-  category 1, not used for category 2.
+- ``source_image``: bare .png filename inside ``images_dir``. A supplied image is
+  copied for every category; a legacy category 2 row may omit it if it has a stem.
 
 Each row is checked independently: a bad row is reported with its line number and
 does not stop the run. Images are copied through emit's own naming helpers, and
@@ -31,6 +32,8 @@ from typing import Any, Optional, Union
 
 from generator.answers import parse_expected_answer
 from generator.emit import (
+    IMAGES_DIRNAME,
+    EmitError,
     ManifestWriter,
     image_path_for,
     problem_id_for,
@@ -41,8 +44,8 @@ from generator.schema import Datapoint, StemLeakWarning
 __all__ = ["GivenInputError", "GivenReport", "package_given"]
 
 FAMILY = "given"
-REQUIRED_KEYS = ("paper_index", "category", "stem", "answer_type")
-OPTIONAL_KEYS = ("answer_exact", "source_image")
+REQUIRED_KEYS = ("paper_index",)
+OPTIONAL_KEYS = ("category", "stem", "answer_type", "answer_exact", "source_image")
 
 
 class GivenInputError(ValueError):
@@ -82,12 +85,15 @@ def _record_from_row(row: Any) -> Datapoint:
         raise ValueError(f"paper_index must be an int; got {index!r}")
     problem_id = problem_id_for(FAMILY, index)
 
-    category = row["category"]
+    category = row.get("category")
     source_image = row.get("source_image")
     image_path: Optional[str] = None
     if category == 1:
         if not isinstance(source_image, str) or not source_image.strip():
             raise ValueError("category 1 requires source_image (a .png filename)")
+    if source_image is not None:
+        if not isinstance(source_image, str) or not source_image.strip():
+            raise ValueError(f"source_image must be a bare .png filename; got {source_image!r}")
         if (
             Path(source_image).name != source_image
             or any(char in source_image for char in ("/", "\\", ":"))
@@ -96,9 +102,10 @@ def _record_from_row(row: Any) -> Datapoint:
             raise ValueError(f"source_image must be a bare .png filename; got {source_image!r}")
         image_path = relative_image_path(problem_id)
 
+    answer_type = row.get("answer_type", "unavailable")
     answer_exact = row.get("answer_exact")
     answer_decimal: Optional[float] = None
-    if row["answer_type"] == "exact":
+    if answer_type == "exact":
         if not isinstance(answer_exact, str) or not answer_exact.strip():
             raise ValueError("answer_type 'exact' requires a non-empty answer_exact string")
         try:
@@ -110,14 +117,14 @@ def _record_from_row(row: Any) -> Datapoint:
         problem_id=problem_id,
         family=FAMILY,
         category=category,
-        stem=row["stem"],
+        stem=row.get("stem"),
         image_path=image_path,
         answer_exact=answer_exact,
         answer_decimal=answer_decimal,
         origin="given",
         paper_index=index,
         source_image=source_image,
-        answer_type=row["answer_type"],
+        answer_type=answer_type,
     )
 
 
@@ -137,6 +144,10 @@ def package_given(
     lines = text.splitlines()
     if not any(line.strip() for line in lines):
         raise GivenInputError(f"{rows_path} has no rows")
+
+    images_out = out_dir / IMAGES_DIRNAME
+    if not overwrite and images_out.is_dir() and any(images_out.iterdir()):
+        raise EmitError(f"{images_out} already contains files; pass overwrite=True to replace them")
 
     report = GivenReport()
     seen: set = set()
