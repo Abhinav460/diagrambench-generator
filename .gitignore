@@ -28,3 +28,5 @@ LLMs_on_Geometry.pdf
 # Secrets
 .env
 .env.*
+results/
+data/
