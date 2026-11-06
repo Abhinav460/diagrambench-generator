@@ -259,7 +259,7 @@ def test_an_unavailable_answer_leaves_both_answer_fields_empty():
     [{"answer_exact": "3", "answer_decimal": None}, {"answer_exact": None, "answer_decimal": 3.0}],
 )
 def test_an_unavailable_answer_rejects_a_stray_value(overrides):
-    with pytest.raises(SchemaValidationError, match="answer_type='unavailable' means there is no answer"):
+    with pytest.raises(SchemaValidationError, match="answer_type='unavailable' means no verified answer"):
         make_given(answer_type="unavailable", **overrides).validate()
 
 
@@ -268,12 +268,36 @@ def test_an_unavailable_answer_rejects_a_stray_value(overrides):
     [
         ({"answer_exact": None}, "answer_exact must be a non-empty string"),
         ({"answer_decimal": None}, "answer_decimal must be a real number"),
-        ({"answer_decimal": 0}, "answer_decimal is zero"),
     ],
 )
 def test_an_exact_given_answer_is_checked_like_any_other(overrides, match):
     with pytest.raises(SchemaValidationError, match=match):
         make_given(**overrides).validate()
+
+
+def test_an_exact_given_answer_may_be_zero():
+    make_given(answer_exact="0", answer_decimal=0.0).validate()
+
+
+def test_given_unknown_category_and_missing_stem_round_trip():
+    record = make_given(
+        category=None, stem=None, answer_type="unavailable",
+        answer_exact=None, answer_decimal=None,
+    )
+    record.validate()
+    assert Datapoint.from_json(record.to_json()) == record
+
+
+def test_only_given_may_have_unknown_category_or_missing_stem():
+    for origin in ("generated", "harvested"):
+        with pytest.raises(SchemaValidationError, match="category must be"):
+            make(origin=origin, category=None).validate()
+        with pytest.raises(SchemaValidationError, match="stem must be"):
+            make(origin=origin, stem=None).validate()
+
+
+def test_given_category_two_may_retain_source_image():
+    make_given(category=2, stem=None, image_path="images/given_00017.png").validate()
 
 
 @pytest.mark.parametrize("origin", ["generated", "harvested"])
