@@ -196,7 +196,7 @@ def main() -> int:
         )
     except (OSError, ValueError) as exc:
         parser.exit(1, f"dataset validation failed: {exc}\n")
-    print(report)
+    print(report, end="")
     return 0
 
 
