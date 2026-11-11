@@ -1,0 +1,5 @@
+1: Proved (AP passes through the midpoint of CD)
+2: Proved (the sum equals 0)
+3: Proved (AI = AR)
+4: Proved (H is the incenter of triangle H_AH_BH_C)
+5: 61
