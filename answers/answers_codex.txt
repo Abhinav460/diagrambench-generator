@@ -1,0 +1,96 @@
+image3: 30°
+image5: 25/8 cm
+image6: 6
+image8: 135°
+image12: 75
+image13: 15°
+image14: 6 - π/4 - 2 arccos(3/5) - (9/2) arccos(4/5) m²
+image15: 90°
+image18: 1296 + 81π
+image20: 27
+image27: 12/5
+image28: π
+image31: 1/3
+image32: 64√3/3 cm²
+image33: 51.05°
+image36: 9√3/2
+image42: 1:3
+image46: 256/17
+image50: 42
+image52: 11 cm
+image53: √610/2 cm
+image54: 25π
+image55: 25 - 25π/4 - 25π(3 - 2√2)² cm²
+image56: 4 - 2√2
+image57: 26
+image60: 270/11
+image63: 14
+image68: 42 cm²
+image71: 6
+image73: 6 + 6√2 cm
+image77: 5 cm²
+image78: 18π
+image79: 2 cm²
+image83: 72
+image84: 7 cm²
+image85: 32
+image86: 135°
+image88: 8 cm²
+image89: 19
+image90: 15
+image92: 2x² + 24x + 46
+image93: 6
+image94: 8
+image95: 4 m²
+image96: √3/2
+image99: 3√255/34 cm
+image100: 5/4 - 3√3/(4π)
+image102: 8 + 4√3 cm²
+image103: 13/2 cm
+image106: 130°
+image108: 420 m²
+image111: 12π
+image114: 5/2
+image115: 3 - 2√2
+image117: SKIPPED
+image118: 135°
+image119: 36
+image120: 117 cm²
+image124: 36
+image126: 3√15
+image129: 1 - π/4 cm²
+image131: 144
+image132: 3
+image134: 3
+image138: 36π
+image145: (π(4 + 2√2) - 4)/(4 - π)
+image147: 18
+image148: 21
+image150: 68
+image156: 30°
+image159: 540
+image160: 25
+image161: 80
+image162: 16 + 8π/3 - 8√3 cm²
+image163: 20
+image164: 75 - 25π/2
+image166: 4π - 8 cm²
+image169: 3√10
+image171: (9 - 2√3)/46
+image172: 100
+image173: 3√2
+image174: 21
+image176: 126
+image177: 40π - 80
+image179: 225√3
+image183: 12 + 6√2
+image184: 30°
+image185: 16 - 4π
+image186: 24(1 + √3) cm
+image188: 25 cm²
+image190: π(6 - 4√2) cm²
+image192: 32
+image195: 35π/2 cm²
+image196: 8
+image199: 100π cm²
+image200: 9
